@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Test artifacts
+test_input.mp4
+test_output*.mp4
+vt_probe.mp4
+review/
+review_samples/
+
+# IDEs
+.idea/
+.vscode/
+
+# Local tooling
+.claude/
+train_hdr_model.bat
+train_hdr_model_recommended.bat
+.serena/
+graphify-out/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Large local training videos (kept on disk, never committed)
+/data/
+
+# Local model outputs generated during training and validation
+/models/*
+!/models/enhancement_model_20260310.pt
+
+# Local historical planning notes (not current documentation)
+/docs/
