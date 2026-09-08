@@ -144,6 +144,7 @@ class AppState:
 class QueueJob:
     request: ConversionRequest | LogConversionRequest | ImageConversionRequest | ImageLogConversionRequest
     status: str = "queued"
+    error: str = ""
 
 
 STATUS_LABELS = {
@@ -175,8 +176,9 @@ def filter_models_for_backend(models: list[Path], backend: str, system_name: str
 class SDR2HDRGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("sdr2hdr")
-        self.root.geometry("1120x720")
+        self.root.title("SDR2HDR Pro")
+        self.root.geometry("1440x900")
+        self.root.minsize(1280, 900)
         self.state = AppState.IDLE
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -236,94 +238,139 @@ class SDR2HDRGUI:
         self.img_log_format_var = tk.StringVar(value=self.img_format_options[".tif"])
 
         self._build()
+        self.root.update_idletasks()
+        width = max(1440, self.root.winfo_reqwidth())
+        height = max(900, self.root.winfo_reqheight())
+        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.root.winfo_screenheight() - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
         self._set_state(AppState.IDLE)
         self.root.after(100, self._drain_events)
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.root, padding=16)
+        from sdr2hdr.gui_style import apply_theme, ButtonSlot
+
+        self.reduce_motion_var = tk.BooleanVar(value=False)
+        apply_theme(self.root, self.reduce_motion_var)
+        outer = ttk.Frame(self.root, padding=20, style="Shell.TFrame")
         outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=3)
-        outer.columnconfigure(1, weight=2)
-        outer.rowconfigure(2, weight=1)
+        outer.columnconfigure(0, weight=3, minsize=670)
+        outer.columnconfigure(1, weight=2, minsize=500)
+        outer.rowconfigure(1, weight=1)
 
-        title = ttk.Label(outer, text="SDR to HDR10 コンバーター", font=("Helvetica", 18, "bold"))
-        title.grid(row=0, column=0, columnspan=2, sticky="w")
-        subtitle = ttk.Label(
-            outer,
-            text="実写映像・画像変換用のキュー対応デスクトップUI",
-            font=("Helvetica", 11),
-        )
-        subtitle.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 16))
+        hero = tk.Frame(outer, bg="#efb4eb", highlightbackground="#14200e", highlightthickness=3)
+        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 16))
+        tk.Label(hero, text="SDR2HDR", font=("Impact", 46), bg="#efb4eb", fg="#14200e").pack(side="left", padx=22, pady=14)
+        tk.Label(hero, text="いつもの映像を、HDRへ。\n素材を選ぶ → 形式を決める → 変換して保存", justify="left", font=("Helvetica Neue", 12), bg="#efb4eb", fg="#14200e").pack(side="left", padx=20)
+        self.hero_art = tk.PhotoImage(file=str(Path(__file__).parent / "assets" / "film-editor.png")).subsample(8)
+        tk.Label(hero, image=self.hero_art, bg="#efb4eb", borderwidth=0).pack(side="right", padx=10, pady=8)
 
-        left = ttk.Frame(outer)
-        left.grid(row=2, column=0, sticky="nsew", padx=(0, 12))
+        left = ttk.Frame(outer, padding=16, style="Card.TFrame")
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(4, weight=1)
-
-        right = ttk.Frame(outer)
-        right.grid(row=2, column=1, sticky="nsew")
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(2, weight=1)
-
+        ttk.Label(left, text="01  /  CONVERT", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 14))
         self.notebook = ttk.Notebook(left)
-        self.notebook.grid(row=0, column=0, sticky="nsew")
-
-        # Tabs
-        self.ai_tab = ttk.Frame(self.notebook, padding=12)
-        self.log_tab = ttk.Frame(self.notebook, padding=12)
-        self.img_ai_tab = ttk.Frame(self.notebook, padding=12)
-        self.img_log_tab = ttk.Frame(self.notebook, padding=12)
-
-        self.notebook.add(self.ai_tab, text=" 動画 AI ")
-        self.notebook.add(self.log_tab, text=" 動画 Log ")
-        self.notebook.add(self.img_ai_tab, text=" 画像 AI ")
-        self.notebook.add(self.img_log_tab, text=" 画像 Log ")
-
+        self.notebook.grid(row=1, column=0, sticky="ew")
+        self.ai_tab = ttk.Frame(self.notebook, padding=8)
+        self.log_tab = ttk.Frame(self.notebook, padding=8)
+        self.img_ai_tab = ttk.Frame(self.notebook, padding=8)
+        self.img_log_tab = ttk.Frame(self.notebook, padding=8)
+        for tab, title in ((self.ai_tab, "動画 AI"), (self.log_tab, "動画 Log"), (self.img_ai_tab, "画像 AI"), (self.img_log_tab, "画像 Log")):
+            self.notebook.add(tab, text=title)
         self._build_ai_tab(self.ai_tab)
         self._build_log_tab(self.log_tab)
         self._build_img_ai_tab(self.img_ai_tab)
         self._build_img_log_tab(self.img_log_tab)
+        # Group existing controls without changing their variables or processing.
+        for tab, groups in ((self.ai_tab, ((0, "素材と保存先 / プリセット"), (4, "出力形式"), (6, "AI設定"))),
+                            (self.img_ai_tab, ((0, "素材と保存先"), (2, "出力形式"), (3, "AI設定")))):
+            for row, title in reversed(groups):
+                for widget in tab.grid_slaves():
+                    info = widget.grid_info()
+                    if int(info["row"]) >= row:
+                        widget.grid_configure(row=int(info["row"]) + 1)
+                ttk.Label(tab, text=title, style="Group.TLabel").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(3, 2))
+        self.feedback_var = tk.StringVar(value="設定した素材を一覧へ追加して、まとめて変換できます。")
+        ttk.Label(left, textvariable=self.feedback_var, style="Muted.TLabel", wraplength=540).grid(row=2, column=0, sticky="ew", pady=(14, 8))
+        add_queue_slot = ButtonSlot(left, self.reduce_motion_var, text="変換待ちに追加", command=self._enqueue_current, style="Accent.TButton")
+        self.add_queue_button = add_queue_slot.button
+        add_queue_slot.grid(row=3, column=0, sticky="ew")
 
-        controls = ttk.Frame(left)
-        controls.grid(row=1, column=0, sticky="ew", pady=(16, 12))
-        self.add_queue_button = ttk.Button(controls, text="キューに追加", command=self._enqueue_current)
-        self.add_queue_button.pack(side="left")
-        self.start_button = ttk.Button(controls, text="キュー開始", command=self._start)
-        self.start_button.pack(side="left", padx=(8, 0))
-        self.stop_button = ttk.Button(controls, text="現在の処理を停止", command=self._stop)
-        self.stop_button.pack(side="left", padx=(8, 0))
-        self.open_output_button = ttk.Button(controls, text="出力を開く", command=self._open_output)
-        self.open_output_button.pack(side="left", padx=(8, 0))
-        self.open_folder_button = ttk.Button(controls, text="フォルダを開く", command=self._open_folder)
-        self.open_folder_button.pack(side="left", padx=(8, 0))
+        right = ttk.Frame(outer, padding=16, style="Card.TFrame")
+        right.grid(row=1, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+        ttk.Label(right, text="02  /  EXPORT", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(right, text="変換待ち一覧", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 8))
+        queue_frame = ttk.Frame(right)
+        queue_frame.grid(row=2, column=0, sticky="nsew")
+        queue_frame.columnconfigure(0, weight=1)
+        queue_frame.rowconfigure(0, weight=1)
+        self.queue_view = ttk.Treeview(queue_frame, columns=("status", "input", "output"), show="headings", height=4)
+        for key, label, width in (("status", "状態", 75), ("input", "入力ファイル", 130), ("output", "出力ファイル", 140)):
+            self.queue_view.heading(key, text=label)
+            self.queue_view.column(key, width=width, minwidth=65, anchor="w")
+        self.queue_view.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(queue_frame, orient="vertical", command=self.queue_view.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.queue_view.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(queue_frame, orient="horizontal", command=self.queue_view.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.queue_view.configure(xscrollcommand=horizontal.set)
+        self.job_detail = tk.Text(queue_frame, height=3, width=20, wrap="char", font=("Helvetica Neue", 10), bg="#fffdf6", fg="#14200e", relief="flat", state="disabled")
+        self.job_detail.grid(row=2, column=0, sticky="ew")
+        detail_scroll = ttk.Scrollbar(queue_frame, command=self.job_detail.yview)
+        detail_scroll.grid(row=2, column=1, sticky="ns")
+        self.job_detail.configure(yscrollcommand=detail_scroll.set)
+        self.detail_scroll = detail_scroll
+        self.job_detail.grid_remove()
+        self.detail_scroll.grid_remove()
+        self.queue_view.bind("<<TreeviewSelect>>", self._show_job_detail)
+        queue_controls = ttk.Frame(right)
+        queue_controls.grid(row=3, column=0, sticky="ew", pady=10)
+        self.remove_queue_button = ttk.Button(queue_controls, text="選択を削除", command=self._remove_selected_job)
+        self.remove_queue_button.pack(side="left")
+        self.clear_queue_button = ttk.Button(queue_controls, text="一覧をクリア", command=self._clear_queue)
+        self.clear_queue_button.pack(side="right")
 
-        status_frame = ttk.Frame(left)
-        status_frame.grid(row=2, column=0, sticky="ew")
-        ttk.Label(status_frame, textvariable=self.status_var, font=("Helvetica", 11, "bold")).pack(anchor="w")
-        ttk.Label(status_frame, textvariable=self.progress_var).pack(anchor="w", pady=(4, 8))
+        status_frame = ttk.Frame(right, padding=14, style="Green.TFrame")
+        status_frame.grid(row=4, column=0, sticky="ew", pady=(6, 12))
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel")
+        self.status_label.pack(anchor="w")
+        ttk.Label(status_frame, textvariable=self.progress_var, style="Green.TLabel", wraplength=330).pack(anchor="w", pady=(6, 12))
+        self.result_var = tk.StringVar()
+        ttk.Label(status_frame, textvariable=self.result_var, style="Green.TLabel", wraplength=330).pack(anchor="w", pady=(0, 5))
         self.progress = ttk.Progressbar(status_frame, mode="determinate", maximum=100)
         self.progress.pack(fill="x")
+        conversion_controls = ttk.Frame(right)
+        conversion_controls.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        conversion_controls.columnconfigure(0, weight=1)
+        conversion_controls.columnconfigure(1, weight=1)
+        start_slot = ButtonSlot(conversion_controls, self.reduce_motion_var, text="HDRへの変換を開始", command=self._start, style="Primary.TButton")
+        self.start_button = start_slot.button
+        start_slot.grid(row=0, column=0, sticky="ew")
+        self.stop_button = ttk.Button(conversion_controls, text="現在の処理を停止", command=self._stop)
+        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        output_controls = ttk.Frame(right)
+        output_controls.grid(row=7, column=0, sticky="ew")
+        open_output_slot = ButtonSlot(output_controls, self.reduce_motion_var, text="出力を開く", command=self._open_output)
+        self.open_output_button = open_output_slot.button
+        open_output_slot.pack(side="left", fill="x", expand=True)
+        self.open_folder_button = ttk.Button(output_controls, text="保存フォルダ", command=self._open_folder)
+        self.open_folder_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Label(right, text="処理ログ", style="Muted.TLabel").grid(row=8, column=0, sticky="w", pady=(18, 6))
+        log_frame = ttk.Frame(right)
+        log_frame.grid(row=9, column=0, sticky="ew")
+        self.log = tk.Text(log_frame, height=3, width=25, wrap="word", state="disabled", bg="#f5f3ec", fg="#14200e", relief="flat", padx=10, pady=8, font=("Menlo", 10), highlightthickness=1, highlightbackground="#14200e")
+        self.log.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=log_scroll.set)
 
-        ttk.Label(left, text="ログ").grid(row=3, column=0, sticky="w", pady=(16, 6))
-        self.log = tk.Text(left, height=16, wrap="word", state="disabled")
-        self.log.grid(row=4, column=0, sticky="nsew")
-
-        queue_controls = ttk.Frame(right)
-        queue_controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.remove_queue_button = ttk.Button(queue_controls, text="選択項目を削除", command=self._remove_selected_job)
-        self.remove_queue_button.pack(side="left")
-        self.clear_queue_button = ttk.Button(queue_controls, text="キューをクリア", command=self._clear_queue)
-        self.clear_queue_button.pack(side="left", padx=(8, 0))
-
-        ttk.Label(right, text="キュー (Queue)").grid(row=1, column=0, sticky="w", pady=(8, 6))
-        self.queue_view = ttk.Treeview(right, columns=("status", "input", "output"), show="headings", height=14)
-        self.queue_view.heading("status", text="ステータス")
-        self.queue_view.heading("input", text="入力ファイル")
-        self.queue_view.heading("output", text="出力ファイル")
-        self.queue_view.column("status", width=90, anchor="w")
-        self.queue_view.column("input", width=170, anchor="w")
-        self.queue_view.column("output", width=220, anchor="w")
-        self.queue_view.grid(row=2, column=0, sticky="nsew")
+        from sdr2hdr.gui_style import FeedbackMotion
+        self.feedback_motion = FeedbackMotion(self.root, self.reduce_motion_var, self.status_label, self.open_output_button)
+        ttk.Checkbutton(right, text="動きを減らす", variable=self.reduce_motion_var).grid(row=10, column=0, sticky="w", pady=(8, 0))
 
         self.input_var.trace_add("write", self._sync_output_path)
         self.log_input_var.trace_add("write", self._sync_log_output_path)
@@ -381,9 +428,9 @@ class SDR2HDRGUI:
             [model_display_name(path) for path in self.filtered_models] or ["互換性のあるモデルがありません"],
         )
         ttk.Button(tab, text="更新", command=self._refresh_available_models).grid(row=7, column=2, padx=(8, 0))
-        ttk.Label(tab, text="AI 強度").grid(row=8, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Label(tab, text="AI 強度").grid(row=8, column=0, sticky="w", pady=2, padx=(0, 12))
         ai_slider_row = ttk.Frame(tab)
-        ai_slider_row.grid(row=8, column=1, sticky="ew", pady=6)
+        ai_slider_row.grid(row=8, column=1, sticky="ew", pady=2)
         ai_slider_row.columnconfigure(0, weight=1)
         self.ai_strength_scale = ttk.Scale(
             ai_slider_row, from_=0.0, to=0.8, orient="horizontal",
@@ -392,9 +439,9 @@ class SDR2HDRGUI:
         self.ai_strength_scale.grid(row=0, column=0, sticky="ew")
         ttk.Label(ai_slider_row, textvariable=self.ai_strength_label_var, width=5).grid(row=0, column=1, padx=(8, 0))
         
-        ttk.Label(tab, text="彩度 (Saturation)").grid(row=9, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Label(tab, text="彩度 (Saturation)").grid(row=9, column=0, sticky="w", pady=2, padx=(0, 12))
         sat_slider_row = ttk.Frame(tab)
-        sat_slider_row.grid(row=9, column=1, sticky="ew", pady=6)
+        sat_slider_row.grid(row=9, column=1, sticky="ew", pady=2)
         sat_slider_row.columnconfigure(0, weight=1)
         self.saturation_scale = ttk.Scale(
             sat_slider_row, from_=0.8, to=1.5, orient="horizontal",
@@ -439,17 +486,17 @@ class SDR2HDRGUI:
             tab, 6, "AI モデル", self.model_name_var,
             [model_display_name(path) for path in self.filtered_models] or ["互換性のあるモデルがありません"],
         )
-        ttk.Label(tab, text="AI 強度").grid(row=7, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Label(tab, text="AI 強度").grid(row=7, column=0, sticky="w", pady=2, padx=(0, 12))
         slider_row = ttk.Frame(tab)
-        slider_row.grid(row=7, column=1, sticky="ew", pady=6)
+        slider_row.grid(row=7, column=1, sticky="ew", pady=2)
         slider_row.columnconfigure(0, weight=1)
         ttk.Scale(slider_row, from_=0.0, to=0.8, orient="horizontal",
                   variable=self.ai_strength_var, command=self._sync_ai_strength_label).grid(row=0, column=0, sticky="ew")
         ttk.Label(slider_row, textvariable=self.ai_strength_label_var, width=5).grid(row=0, column=1, padx=(8, 0))
         
-        ttk.Label(tab, text="彩度 (Saturation)").grid(row=8, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Label(tab, text="彩度 (Saturation)").grid(row=8, column=0, sticky="w", pady=2, padx=(0, 12))
         img_sat_slider_row = ttk.Frame(tab)
-        img_sat_slider_row.grid(row=8, column=1, sticky="ew", pady=6)
+        img_sat_slider_row.grid(row=8, column=1, sticky="ew", pady=2)
         img_sat_slider_row.columnconfigure(0, weight=1)
         ttk.Scale(img_sat_slider_row, from_=0.8, to=1.5, orient="horizontal",
                   variable=self.saturation_var, command=self._sync_saturation_label).grid(row=0, column=0, sticky="ew")
@@ -477,10 +524,10 @@ class SDR2HDRGUI:
         browse_command: object,
     ) -> ttk.Entry:
         path_label = ttk.Label(parent, text=label)
-        path_label.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+        path_label.grid(row=row, column=0, sticky="w", pady=2, padx=(0, 12))
         self._path_labels[str(variable)] = (path_label, label)
         entry = ttk.Entry(parent, textvariable=variable)
-        entry.grid(row=row, column=1, sticky="ew", pady=6)
+        entry.grid(row=row, column=1, sticky="ew", pady=2)
         ttk.Button(parent, text="参照", command=browse_command).grid(row=row, column=2, padx=(8, 0))
         return entry
 
@@ -492,15 +539,15 @@ class SDR2HDRGUI:
         variable: tk.StringVar,
         values: list[str],
     ) -> ttk.Combobox:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2, padx=(0, 12))
         combo = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
-        combo.grid(row=row, column=1, sticky="w", pady=6)
+        combo.grid(row=row, column=1, sticky="ew", pady=2)
         return combo
 
     def _add_format_row(self, parent, row, label, variable, values, description):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="nw", pady=6, padx=(0, 12))
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="nw", pady=2, padx=(0, 12))
         frame = ttk.Frame(parent)
-        frame.grid(row=row, column=1, sticky="ew", pady=6)
+        frame.grid(row=row, column=1, sticky="ew", pady=2)
         frame.columnconfigure(0, weight=1)
         combo = ttk.Combobox(frame, textvariable=variable, values=values, state="readonly")
         combo.grid(row=0, column=0, sticky="ew")
@@ -511,9 +558,9 @@ class SDR2HDRGUI:
 
     def _add_exr_delivery_row(self, parent, row, variable):
         label = ttk.Label(parent, text="保存方法")
-        label.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+        label.grid(row=row, column=0, sticky="w", pady=2, padx=(0, 12))
         combo = ttk.Combobox(parent, textvariable=variable, values=list(EXR_DELIVERY_OPTIONS.values()), state="readonly", width=30)
-        combo.grid(row=row, column=1, sticky="ew", pady=6)
+        combo.grid(row=row, column=1, sticky="ew", pady=2)
         return (label, combo), combo
 
     def _selected_exr_delivery(self, log_mode=False):
@@ -836,6 +883,7 @@ class SDR2HDRGUI:
         return ("pending", Path(request.input_path).name, Path(request.output_path).name)
 
     def _refresh_job_list(self) -> None:
+        selected = self.queue_view.selection() if hasattr(self, "job_detail") else ()
         self.queue_view.delete(*self.queue_view.get_children())
         for index, job in enumerate(self.queue_jobs):
             self.queue_view.insert(
@@ -849,6 +897,19 @@ class SDR2HDRGUI:
                 ),
             )
 
+        if hasattr(self, "job_detail"):
+            valid = [item for item in selected if self.queue_view.exists(item)]
+            if valid:
+                self.queue_view.selection_set(valid)
+                self._show_job_detail()
+            else:
+                self.job_detail.configure(state="normal")
+                self.job_detail.delete("1.0", "end")
+                self.job_detail.configure(state="disabled")
+                self.job_detail.grid_remove()
+                self.detail_scroll.grid_remove()
+            self.start_button.configure(state="disabled" if self.state in {AppState.RUNNING, AppState.CANCELLING} or (self.queue_jobs and self._next_pending_job_index() is None) else "normal")
+
     def _set_job_status(self, index: int | None, status: str) -> None:
         if index is None:
             return
@@ -861,6 +922,10 @@ class SDR2HDRGUI:
         self.queue_jobs.append(QueueJob(request=request))
         self.last_output_path = request.output_path
         self._refresh_job_list()
+        if hasattr(self, "feedback_motion"):
+            self.start_button.configure(state="normal")
+            if not getattr(self, "_batch_adding", False):
+                self._feedback("added", f"追加しました: {Path(request.input_path).name}", str(len(self.queue_jobs) - 1))
         mode_text = "AI (動画)" if isinstance(request, ConversionRequest) else \
                     "Log (動画)" if isinstance(request, LogConversionRequest) else \
                     "AI (画像)" if isinstance(request, ImageConversionRequest) else "Log (画像)"
@@ -870,7 +935,7 @@ class SDR2HDRGUI:
         try:
             self._enqueue_inputs()
         except ValueError as exc:
-            messagebox.showerror("キューに追加できません", str(exc))
+            self._feedback("error", str(exc))
 
     def _enqueue_inputs(self):
         template = self._build_request()
@@ -899,8 +964,13 @@ class SDR2HDRGUI:
             self._validate_request(request)
             used.add(destination.resolve())
             requests.append(request)
-        for request in requests:
-            self._enqueue_request(request)
+        self._batch_adding = True
+        try:
+            for request in requests:
+                self._enqueue_request(request)
+        finally:
+            self._batch_adding = False
+        self._feedback("added", f"{len(requests)}件を追加しました", tuple(str(i) for i in range(len(self.queue_jobs)-len(requests), len(self.queue_jobs))))
 
     def _selected_job_indices(self) -> list[int]:
         return sorted((int(item_id) for item_id in self.queue_view.selection()), reverse=True)
@@ -978,7 +1048,7 @@ class SDR2HDRGUI:
             try:
                 self._enqueue_inputs()
             except ValueError as exc:
-                messagebox.showerror("開始できません", str(exc))
+                self._feedback("error", str(exc))
                 return
         next_index = self._next_pending_job_index()
         if next_index is None:
@@ -1005,8 +1075,60 @@ class SDR2HDRGUI:
             return
         open_path(str(Path(self.last_output_path).parent))
 
+    def _show_job_detail(self, *_):
+        selected = self.queue_view.selection()
+        if not selected:
+            self.job_detail.grid_remove()
+            self.detail_scroll.grid_remove()
+            return
+        self.job_detail.grid()
+        self.detail_scroll.grid()
+        index = int(selected[0])
+        if index >= len(self.queue_jobs):
+            return
+        job = self.queue_jobs[index]
+        text = f"入力: {job.request.input_path}\n保存先: {job.request.output_path}"
+        if job.error:
+            text += f"\n失敗理由: {job.error}"
+        self.job_detail.configure(state="normal")
+        self.job_detail.delete("1.0", "end")
+        self.job_detail.insert("1.0", text)
+        self.job_detail.configure(state="disabled")
+
+    def _feedback(self, kind, message, row=None):
+        if not hasattr(self, "feedback_motion"):
+            return
+        if kind in {"start", "complete", "stopped"}:
+            self.result_var.set(message)
+        else:
+            self.feedback_var.set(message)
+        target = None
+        if kind == "error":
+            entries = (
+                (self.input_entry, self.output_entry),
+                (self.log_input_entry, self.log_output_entry),
+                (self.img_input_entry, self.img_output_entry),
+                (self.img_log_input_entry, self.img_log_output_entry),
+            )[self.notebook.index("current")]
+            # Only identify a field when its missing value is directly observable.
+            for entry in entries:
+                if not entry.get().strip():
+                    entry.focus_set()
+                    target = entry
+                    break
+        self.feedback_motion.cue(kind, self.queue_view if row is not None else None, row, target)
+
     def _set_state(self, state: str) -> None:
+        previous = self.state
         self.state = state
+        if previous != state:
+            cues = {
+                AppState.RUNNING: ("start", "変換を開始しました。右側で進捗を確認できます。"),
+                AppState.COMPLETED: ("complete", "保存が完了しました。「出力を開く」で確認できます。"),
+                AppState.CANCELLED: ("stopped", "処理を停止しました。"),
+            }
+            if state in cues:
+                self._feedback(*cues[state])
         running = state in {AppState.RUNNING, AppState.CANCELLING}
         idle_like = state in {AppState.IDLE, AppState.COMPLETED, AppState.FAILED, AppState.CANCELLED}
         field_state = "disabled" if running else "normal"
@@ -1019,7 +1141,7 @@ class SDR2HDRGUI:
         self.img_output_entry.configure(state=field_state)
         self.img_log_input_entry.configure(state=field_state)
         self.img_log_output_entry.configure(state=field_state)
-        self.start_button.configure(state="disabled" if running else "normal")
+        self.start_button.configure(state="disabled" if running or (self.queue_jobs and self._next_pending_job_index() is None) else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
         self.add_queue_button.configure(state="disabled" if running else "normal")
         self.remove_queue_button.configure(state="disabled" if running else "normal")
@@ -1095,10 +1217,13 @@ class SDR2HDRGUI:
             elif kind == "failed":
                 self.progress.stop()
                 self.progress.configure(value=0)
+                if self.current_job_index is not None:
+                    self.queue_jobs[self.current_job_index].error = str(payload)
                 self._set_job_status(self.current_job_index, "failed")
                 self.status_var.set("失敗")
                 self.progress_var.set("変換に失敗しました")
                 self._log(str(payload))
+                self._feedback("error", str(payload))
                 self._finish_current_job()
                 next_index = self._next_pending_job_index()
                 if next_index is not None:
@@ -1112,7 +1237,9 @@ class SDR2HDRGUI:
 
 def main() -> int:
     root = tk.Tk()
+    root.withdraw()
     app = SDR2HDRGUI(root)
+    root.deiconify()
     app._log("準備完了")
     root.mainloop()
     return 0
