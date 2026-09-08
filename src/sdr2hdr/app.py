@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
+import zipfile
+from functools import wraps
 import platform
 import queue
 import threading
@@ -12,16 +16,22 @@ from typing import Any, Callable, Optional
 from sdr2hdr.ai import TorchMapEnhancer
 from sdr2hdr.io import (
     ffprobe_video,
+    ffprobe_audio_codecs,
+    build_log_encoder_command,
+    log_output_filter,
+    start_logged_process,
     finalize_process,
-    has_expected_hdr_metadata,
     open_decoder,
     open_encoder,
     read_frame,
     restamp_hdr_metadata,
-    is_videotoolbox_available,
     require_exr_metadata_tool,
     stamp_ap1_exr_sequence,
+    exr_sequence_paths,
+    restamp_prores_metadata,
 )
+
+from .output_color import ACES_OUTPUTS, EXR_ENCODERS, HLG_ENCODER, PRORES_ENCODERS, OutputColorTransform, EXRVideoTransform
 
 # AI libraries are imported lazily inside run_conversion to ensure physical separation
 # and avoid loading heavy dependencies when only using Log Passthrough mode.
@@ -168,6 +178,7 @@ class ConversionRequest:
     hdr_guidance: str = "auto"
     luminance_guidance_strength: float = 0.70
     reconstruction_strength: float = 0.60
+    exr_delivery: str = "zip"
 
 
 @dataclass
@@ -181,6 +192,7 @@ class LogConversionRequest:
     max_frames: int | None = None
     keep_partial_output_on_cancel: bool = True
     verify_hdr_metadata: bool = True
+    exr_delivery: str = "zip"
 
 
 @dataclass
@@ -235,25 +247,240 @@ class CancelToken:
         self.cancel_requested = True
 
 
-def build_output_path(input_path: str, extension: Optional[str] = None, encoder: Optional[str] = None) -> str:
+def output_extensions(encoder: str | None = None, exr_delivery: str = "zip") -> tuple[str, ...]:
+    if encoder in PRORES_ENCODERS:
+        return (".mov",)
+    if encoder in EXR_ENCODERS:
+        return (".mov",) if exr_delivery == "video" else (".zip",)
+    return (".mp4", ".mov", ".mkv")
+
+
+def build_output_path(input_path: str, extension: Optional[str] = None, encoder: Optional[str] = None, exr_delivery: str = "zip") -> str:
     path = Path(input_path)
-    if not path.suffix:
-        return str(path.with_name(f"{path.name}_hdr"))
-    suffix = path.suffix.lower()
-    
-    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".avif", ".tif", ".tiff"}:
-        # 静止画の場合
-        output_suffix = extension or ".tif"
+    if extension:
+        suffix = extension
+    elif encoder is None and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".avif", ".tif", ".tiff", ".jxl"}:
+        suffix = ".tif"
     else:
-        # 動画の場合
-        if encoder in {"prores_422hq", "prores_4444", "prores_4444_xq"}:
-            output_suffix = ".mov"
-        elif encoder in {"openexr", "openexr_acescg"}:
-            return str(path.with_name(f"{path.stem}_hdr_%06d.exr"))
-        else:
-            output_suffix = ".mp4" if suffix in {".m2ts", ".mts", ".m2t", ".ts"} else path.suffix
-        
-    return str(path.with_name(f"{path.stem}_hdr{output_suffix}"))
+        suffix = output_extensions(encoder, exr_delivery)[0]
+    return str(path.with_name(f"{path.stem}_hdr{suffix}"))
+
+
+def validate_export_request(request) -> None:
+    source, output = Path(request.input_path), Path(request.output_path)
+    if not request.input_path.strip() or not source.is_file():
+        raise ValueError(f"Input file does not exist: {source}")
+    if not request.output_path.strip():
+        raise ValueError("Output path is required.")
+    if source.resolve() == output.resolve():
+        raise ValueError("Input and output paths must be different.")
+    if isinstance(request, (ConversionRequest, LogConversionRequest)):
+        valid = HDR10_ENCODERS | PRORES_ENCODERS | EXR_ENCODERS | {HLG_ENCODER}
+        if isinstance(request, LogConversionRequest):
+            valid -= {*ACES_OUTPUTS, HLG_ENCODER}
+        if request.encoder not in valid:
+            raise ValueError(f"Unsupported encoder for this mode: {request.encoder}")
+        if request.exr_delivery not in {"zip", "video"}:
+            raise ValueError(f"Unknown EXR delivery: {request.exr_delivery}")
+        extensions = output_extensions(request.encoder, request.exr_delivery)
+        if request.x265_mode not in X265_PROFILE_DEFAULTS:
+            raise ValueError(f"Unknown x265 mode: {request.x265_mode}")
+        if request.max_frames is not None and request.max_frames <= 0:
+            raise ValueError("max_frames must be positive.")
+        if request.encoder in {"openexr_acescg", *ACES_OUTPUTS}:
+            require_exr_metadata_tool()
+    else:
+        extensions = (".tif", ".tiff", ".jxl", ".avif", ".jpg", ".jpeg", ".png")
+        if output.suffix.lower() in {".jpg", ".jpeg"}:
+            from sdr2hdr.io import require_ultrahdr_tool
+            require_ultrahdr_tool()
+    if output.suffix.lower() not in extensions:
+        raise ValueError(f"選択した出力形式には {', '.join(extensions)} の拡張子が必要です。")
+
+
+def _publish_output(function):
+    """Work in an owned directory; publish only after processing and packaging."""
+    @wraps(function)
+    def run(request, callbacks=None, cancel_token=None):
+        validate_export_request(request)
+        destination = Path(request.output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        exr = getattr(request, "encoder", None) in EXR_ENCODERS
+        inner_callbacks = replace(callbacks, on_complete=None) if callbacks else None
+        with tempfile.TemporaryDirectory(prefix=".sdr2hdr-", dir=destination.parent) as directory:
+            root = Path(directory)
+            working = root / ("frame_%06d.exr" if exr else destination.name)
+            if cancel_token and cancel_token.cancel_requested:
+                result = ConversionResult(str(destination), 0, None, cancelled=True)
+            else:
+                result = function(replace(request, output_path=str(working)), inner_callbacks, cancel_token)
+            if exr and not result.cancelled and request.exr_delivery == "video":
+                video = root / destination.name
+                result.cancelled = _encode_exr_video(request, str(working), str(video),
+                                                     result.processed_frames, callbacks, cancel_token)
+                working = video
+            elif exr and not result.cancelled:
+                _emit_status(callbacks, "EXR連番をZIPにまとめています")
+                frames = exr_sequence_paths(str(working), result.processed_frames)
+                if not frames or any(not frame.is_file() for frame in frames):
+                    raise RuntimeError("EXR frame sequence is incomplete.")
+                files = list(frames)
+                audio_codecs = ffprobe_audio_codecs(request.input_path)
+                if audio_codecs:
+                    # Keep MOV for existing compatible tracks; Matroska also
+                    # supports Opus/Vorbis/FLAC without changing the audio codec.
+                    mov_codecs = {"aac", "mp3", "ac3", "eac3", "alac",
+                                  "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
+                                  "pcm_s32le", "pcm_s32be", "pcm_f32le", "pcm_f32be",
+                                  "pcm_f64le", "pcm_f64be", "pcm_u8"}
+                    audio = root / ("audio.mov" if all(codec in mov_codecs for codec in audio_codecs)
+                                    else "audio.mka")
+                    cmd = ["ffmpeg", "-v", "error", "-i", request.input_path,
+                           "-map", "0:a", "-c:a", "copy", "-vn", str(audio)]
+                    _, cancelled = _run_ffmpeg(cmd, None, cancel_token, result.total_frames)
+                    if cancelled:
+                        result.cancelled = True
+                    else:
+                        files.append(audio)
+                archive = root / destination.name
+                if not result.cancelled:
+                    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as bundle:
+                        for file in files:
+                            if cancel_token and cancel_token.cancel_requested:
+                                result.cancelled = True
+                                break
+                            bundle.write(file, file.name)
+                    working = archive
+            if cancel_token and cancel_token.cancel_requested:
+                result.cancelled = True
+            # The GUI discards partial output. The existing CLI option can keep a
+            # video fragment, but never replaces an existing file on cancellation.
+            keep_partial = (not exr and getattr(request, "keep_partial_output_on_cancel", False)
+                            and result.processed_frames > 0 and not destination.exists())
+            if not result.cancelled or keep_partial:
+                if not working.is_file() or working.stat().st_size == 0:
+                    raise RuntimeError("No output file was produced.")
+                working.replace(destination)
+            result = replace(result, output_path=str(destination))
+        _emit_status(callbacks, "キャンセル済" if result.cancelled else "完了")
+        _emit_complete(callbacks, result)
+        return result
+    return run
+
+
+def _encode_exr_video(request, pattern, output_path, frame_count, callbacks, cancel_token):
+    import numpy as np
+    from .hdr_guidance import resolve_anchor_nits
+
+    if isinstance(request, ConversionRequest):
+        config, _, _ = build_request_config(request)
+        white = resolve_anchor_nits(config.tone, config.peak_nits, config.diffuse_white_nits)
+    else:
+        white = 100.0  # The existing Log zscale path's linear reference.
+    transform = EXRVideoTransform(request.encoder, white)
+    info = ffprobe_video(request.input_path)
+    # Log decoding can apply the input's display rotation before saving EXR.
+    # Read dimensions from those pixels, while retaining the source frame rate.
+    frame_info = ffprobe_video(str(exr_sequence_paths(pattern, 1)[0]))
+    info = replace(info, width=frame_info.width, height=frame_info.height)
+    _emit_status(callbacks, "EXRからBT.2020/PQのHDR動画へ変換中")
+    encoder = open_encoder(output_path, request.input_path, info, 1000, encoder="prores_4444")
+    decoder = None
+    cancelled = False
+    error = None
+    start = time.monotonic()
+    try:
+        decoder = start_logged_process([
+            "ffmpeg", "-v", "error", "-framerate", f"{info.fps:.06f}",
+            "-start_number", "1", "-i", pattern, "-frames:v", str(frame_count),
+            "-f", "rawvideo", "-pix_fmt", "gbrpf32le", "-",
+        ], stdout=subprocess.PIPE)
+        for index in range(frame_count):
+            if cancel_token and cancel_token.cancel_requested:
+                cancelled = True
+                break
+            raw = decoder.stdout.read(info.width * info.height * 12)
+            if len(raw) != info.width * info.height * 12:
+                raise RuntimeError(f"Missing or incomplete EXR frame {index + 1}")
+            rgb = np.frombuffer(raw, dtype="<f4").reshape(3, info.height, info.width)
+            rgb = rgb[[2, 0, 1]].transpose(1, 2, 0)  # GBR planes -> RGB pixels.
+            pq = transform.to_pq(rgb)
+            pixels = np.clip(np.round(pq * 65535), 0, 65535).astype("<u2")
+            encoder.stdin.write(pixels.tobytes())
+            _emit_progress(callbacks, index + 1, frame_count,
+                           (index + 1) / max(time.monotonic() - start, 1e-6))
+    except Exception as exc:
+        error = exc
+    finally:
+        if cancelled or error is not None:
+            _terminate_process(decoder)
+            _terminate_process(encoder)
+        try:
+            finalize_process(encoder, "EXR video encoder")
+        except RuntimeError as exc:
+            if not cancelled and (error is None or isinstance(error, BrokenPipeError)):
+                error = exc
+        if decoder is not None:
+            try:
+                finalize_process(decoder, "EXR video decoder")
+            except RuntimeError as exc:
+                if not cancelled and error is None:
+                    error = exc
+    if error is not None:
+        raise error
+    if not cancelled:
+        restamp_prores_metadata(output_path)
+    return cancelled
+
+
+def _run_ffmpeg(cmd, callbacks, cancel_token, total_frames):
+    """Consume progress continuously and check cancellation even without output."""
+    events = queue.Queue()
+    process = start_logged_process(cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]],
+                                   stdout=subprocess.PIPE)
+    def read_progress():
+        for line in process.stdout:
+            if line.startswith(b"frame="):
+                events.put(int(line.split(b"=", 1)[1]))
+    reader = threading.Thread(target=read_progress, daemon=True)
+    reader.start()
+    processed, cancelled = 0, False
+    start = time.monotonic()
+    try:
+        while process.poll() is None or not events.empty():
+            if cancel_token and cancel_token.cancel_requested:
+                cancelled = True
+                _terminate_process(process)
+                break
+            try:
+                processed = events.get(timeout=0.1)
+                _emit_progress(callbacks, processed, total_frames, processed / max(time.monotonic()-start, 1e-6))
+            except queue.Empty:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        reader.join(timeout=5)
+        while not events.empty():
+            processed = events.get_nowait()
+        try:
+            finalize_process(process, "FFmpeg")
+        except RuntimeError:
+            if not cancelled:
+                raise
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        reader.join(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        log = getattr(process, "_stderr_log", None)
+        if log is not None and not log.closed:
+            log.close()
+    return processed, cancelled
 
 
 def build_request_config(request: ConversionRequest | ImageConversionRequest) -> tuple[object, str, int]:
@@ -262,6 +489,8 @@ def build_request_config(request: ConversionRequest | ImageConversionRequest) ->
     config = replace(presets[request.preset])
     if getattr(request, "encoder", None) == "openexr_acescg":
         config.output_color_space = "acescg_linear"
+    if getattr(request, "encoder", None) in {*ACES_OUTPUTS, HLG_ENCODER}:
+        config.output_color_space = request.encoder
     if request.preset in {"portrait", "natural"} and request.model_path and request.ai_strength is None:
         config.ai_strength = 0.25 if request.preset == "portrait" else 0.15
     if request.peak_nits is not None:
@@ -292,6 +521,7 @@ def build_request_config(request: ConversionRequest | ImageConversionRequest) ->
 
 
 def validate_request(request: ConversionRequest | ImageConversionRequest) -> None:
+    validate_export_request(request)
     if getattr(request, "hdr_guidance", "auto") not in {"auto", "on", "off"}:
         raise ValueError(f"Unknown hdr_guidance option: {request.hdr_guidance}")
     if (
@@ -329,11 +559,16 @@ def validate_request(request: ConversionRequest | ImageConversionRequest) -> Non
         "prores_4444_xq",
         "openexr",
         "openexr_acescg",
+        *ACES_OUTPUTS,
+        HLG_ENCODER,
     }
     if hasattr(request, "encoder") and request.encoder not in valid_encoders:
         raise ValueError(f"Unknown encoder: {request.encoder}")
-    if getattr(request, "encoder", None) == "openexr_acescg":
+    if getattr(request, "encoder", None) in {"openexr_acescg", *ACES_OUTPUTS}:
         require_exr_metadata_tool()
+    if getattr(request, "encoder", None) in {*ACES_OUTPUTS, HLG_ENCODER}:
+        config, _, _ = build_request_config(request)
+        OutputColorTransform(request.encoder, config.peak_nits)
     if hasattr(request, "x265_mode") and request.x265_mode not in X265_PROFILE_DEFAULTS:
         raise ValueError(f"Unknown x265 mode: {request.x265_mode}")
     if request.model_path and not model_path.exists():
@@ -425,19 +660,21 @@ def _terminate_process(process: object | None) -> None:
 def _wait_terminated_process(process: object | None) -> None:
     if process is None:
         return
-    for handle_name in ("stdin", "stdout", "stderr"):
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    for handle_name in ("stdin", "stdout", "stderr", "_stderr_log"):
         handle = getattr(process, handle_name, None)
         if handle is not None:
             try:
                 handle.close()
-            except Exception:
+            except (OSError, ValueError):
                 pass
-    try:
-        process.wait(timeout=5)
-    except Exception:
-        pass
 
 
+@_publish_output
 def run_conversion(
     request: ConversionRequest,
     callbacks: ConversionCallbacks | None = None,
@@ -477,8 +714,10 @@ def _run_conversion_once(
     import torch
 
     config, x265_preset, x265_crf = build_request_config(request)
-    if request.encoder == "openexr_acescg":
+    if request.encoder in {"openexr_acescg", *ACES_OUTPUTS}:
         require_exr_metadata_tool()
+    if request.encoder in ACES_OUTPUTS:
+        exr_sequence_paths(request.output_path, 2)
     info = ffprobe_video(request.input_path)
     total_frames = request.max_frames if request.max_frames is not None else info.frames
     processor = SDRToHDRProcessor(config, enhancer=HeuristicEnhancer())
@@ -493,7 +732,6 @@ def _run_conversion_once(
                 raise RuntimeError("HDR Guidance requires a v2 5-channel model.")
         else:
             raise RuntimeError("HDR Guidance requires a v2 5-channel model.")
-    decoder = open_decoder(request.input_path, info)
     encoder = open_encoder(
         request.output_path,
         request.input_path,
@@ -503,9 +741,14 @@ def _run_conversion_once(
         x265_preset=x265_preset,
         x265_crf=x265_crf,
     )
+    try:
+        decoder = open_decoder(request.input_path, info)
+    except BaseException:
+        _terminate_process(encoder)
+        _wait_terminated_process(encoder)
+        raise
     processed = 0
     cancelled = False
-    encoder_broken_pipe = False
     start = time.monotonic()
     _emit_status(callbacks, "Preparing conversion")
 
@@ -513,40 +756,64 @@ def _run_conversion_once(
     decode_q: queue.Queue = queue.Queue(maxsize=3)
     encode_q: queue.Queue = queue.Queue(maxsize=3)
     pipeline_error: list[BaseException] = []
+    abort = threading.Event()
+    stop_decode = threading.Event()
+    decoder_eof = threading.Event()
+
+    def put_item(target, item, *, decoding=False):
+        while not abort.is_set():
+            if decoding and (stop_decode.is_set() or (cancel_token and cancel_token.cancel_requested)):
+                return False
+            try:
+                target.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                if not decoding and cancel_token and cancel_token.cancel_requested and item is not _SENTINEL:
+                    return False
+        return False
+
 
     def _decoder_thread() -> None:
         try:
             frame_count = 0
             while True:
-                if cancel_token and cancel_token.cancel_requested:
+                if abort.is_set() or stop_decode.is_set() or (cancel_token and cancel_token.cancel_requested):
                     break
                 if request.max_frames is not None and frame_count >= request.max_frames:
                     break
                 frame = read_frame(decoder, info.width, info.height)
                 if frame is None:
+                    decoder_eof.set()
                     break
-                decode_q.put(frame)
+                if not put_item(decode_q, frame, decoding=True):
+                    break
                 frame_count += 1
         except Exception as exc:
             pipeline_error.append(exc)
+            abort.set()
         finally:
-            decode_q.put(_SENTINEL)
+            put_item(decode_q, _SENTINEL, decoding=True)
 
     def _encoder_thread() -> None:
-        nonlocal encoder_broken_pipe
         try:
             assert encoder.stdin is not None
             while True:
-                item = encode_q.get()
+                if abort.is_set():
+                    break
+                try:
+                    item = encode_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if item is _SENTINEL:
                     break
                 try:
                     encoder.stdin.write(item.tobytes())
                 except BrokenPipeError:
-                    encoder_broken_pipe = True
+                    abort.set()
                     break
         except Exception as exc:
             pipeline_error.append(exc)
+            abort.set()
 
     dec_thread = threading.Thread(target=_decoder_thread, daemon=True)
     enc_thread = threading.Thread(target=_encoder_thread, daemon=True)
@@ -557,70 +824,88 @@ def _run_conversion_once(
         while True:
             if cancel_token and cancel_token.cancel_requested:
                 cancelled = True
+                if not request.keep_partial_output_on_cancel or request.encoder in EXR_ENCODERS:
+                    abort.set()
+                    _terminate_process(encoder)
                 _emit_status(callbacks, "Cancelling")
                 break
-            if encoder_broken_pipe:
+            if abort.is_set():
                 break
-            item = decode_q.get()
+            try:
+                item = decode_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if item is _SENTINEL:
                 break
             hdr_frame = processor.process_frame(item)
-            encode_q.put(hdr_frame)
+            if not put_item(encode_q, hdr_frame):
+                continue
             processed += 1
             if processed == 1:
                 _emit_status(callbacks, "Converting")
             elapsed = max(time.monotonic() - start, 1e-6)
             fps = processed / elapsed
             _emit_progress(callbacks, processed, total_frames, fps)
-        encode_q.put(_SENTINEL)
+        stop_decode.set()
+        if not decoder_eof.is_set():
+            _terminate_process(decoder)
+        put_item(encode_q, _SENTINEL)
         enc_thread.join(timeout=30)
-        dec_thread.join(timeout=10)
+        dec_thread.join(timeout=5)
+        if enc_thread.is_alive():
+            abort.set()
+            _terminate_process(encoder)
+            enc_thread.join(timeout=5)
+            raise RuntimeError("Encoder did not finish after the frame pipeline stopped.")
         if pipeline_error:
             raise pipeline_error[0]
     except Exception as exc:
         _emit_error(callbacks, str(exc))
         raise
     finally:
-        if cancelled:
+        abort.set()
+        stop_decode.set()
+        if not decoder_eof.is_set():
             _terminate_process(decoder)
-            _wait_terminated_process(decoder)
-            finalize_process(encoder, "encoder", allow_broken_pipe=True)
-        else:
-            encoder_error: RuntimeError | None = None
-            try:
-                finalize_process(
-                    encoder,
-                    "encoder",
-                    allow_broken_pipe=bool(request.max_frames) or encoder_broken_pipe,
-                )
-            except RuntimeError as exc:
+        if enc_thread.is_alive():
+            _terminate_process(encoder)
+        dec_thread.join(timeout=5)
+        enc_thread.join(timeout=5)
+        encoder_error = None
+        try:
+            finalize_process(encoder, "encoder", allow_broken_pipe=False)
+        except RuntimeError as exc:
+            if not cancelled:
                 encoder_error = exc
-            try:
-                finalize_process(
-                    decoder,
-                    "decoder",
-                    allow_broken_pipe=bool(request.max_frames) or encoder_broken_pipe or encoder_error is not None,
-                )
-            except RuntimeError:
-                if encoder_error is None:
-                    raise
-            if encoder_error is not None:
-                raise encoder_error
-    if request.encoder == "openexr_acescg" and processed > 0:
-        from sdr2hdr.hdr_guidance import resolve_anchor_nits
-        _emit_status(callbacks, "Writing AP1 EXR color metadata")
-        stamp_ap1_exr_sequence(
-            request.output_path, processed,
-            resolve_anchor_nits(config.tone, config.peak_nits, config.diffuse_white_nits),
-        )
+        # We explicitly stop the decoder on cancellation, frame limit and error.
+        try:
+            finalize_process(decoder, "decoder", allow_broken_pipe=True)
+        except RuntimeError:
+            if decoder_eof.is_set() and not (cancelled or request.max_frames or encoder_error or pipeline_error):
+                raise
+        if encoder_error is not None:
+            raise encoder_error
+    keep_output = not cancelled or request.keep_partial_output_on_cancel
+    if processed > 0 and keep_output and not (cancelled and request.encoder in EXR_ENCODERS):
+        if request.encoder in {"openexr_acescg", *ACES_OUTPUTS}:
+            from sdr2hdr.hdr_guidance import resolve_anchor_nits
+            _emit_status(callbacks, "Writing EXR color metadata")
+            stamp_ap1_exr_sequence(
+                request.output_path, processed,
+                resolve_anchor_nits(config.tone, config.peak_nits, config.diffuse_white_nits),
+                aces_output=request.encoder if request.encoder in ACES_OUTPUTS else None,
+            )
+        elif request.encoder in PRORES_ENCODERS:
+            _emit_status(callbacks, "Writing ProRes HDR color metadata")
+            restamp_prores_metadata(request.output_path)
     if cancelled:
-        if request.keep_partial_output_on_cancel and processed > 0 and request.encoder not in {"openexr", "openexr_acescg"}:
+        if keep_output and processed > 0 and request.encoder in HDR10_ENCODERS:
             restamp_hdr_metadata(request.output_path)
-        if not request.keep_partial_output_on_cancel or processed == 0:
-            try:
-                os.remove(request.output_path)
-            except FileNotFoundError:
-                pass
+        if not keep_output or processed == 0:
+            outputs = (exr_sequence_paths(request.output_path, processed)
+                       if request.encoder in EXR_ENCODERS else [Path(request.output_path)])
+            for output in outputs:
+                output.unlink(missing_ok=True)
         result = ConversionResult(
             output_path=request.output_path,
             processed_frames=processed,
@@ -633,158 +918,37 @@ def _run_conversion_once(
         raise RuntimeError("No frames were processed. Check the input path and video stream.")
     measured_cll, measured_fall = processor.get_measured_hdr_metadata()
     if request.encoder in HDR10_ENCODERS and request.verify_hdr_metadata:
-        _emit_status(callbacks, "HDR metadata missing; repairing output tags")
+        _emit_status(callbacks, "Writing measured HDR metadata without re-encoding")
         restamp_hdr_metadata(request.output_path, int(round(measured_cll)), int(round(measured_fall)))
     result = ConversionResult(output_path=request.output_path, processed_frames=processed, total_frames=total_frames)
-    _emit_status(callbacks, "Completed")
     _emit_complete(callbacks, result)
     return result
 
-def run_log_conversion(
-    request: LogConversionRequest,
-    callbacks: ConversionCallbacks | None = None,
-    cancel_token: CancelToken | None = None,
-) -> ConversionResult:
-    # バリデーション (AIモデル関連のチェックは一切行わない)
-    input_path = Path(request.input_path)
-    output_path = Path(request.output_path)
-    if not input_path.exists():
-        raise ValueError(f"Input file does not exist: {input_path}")
-    if not request.output_path.strip():
-        raise ValueError("Output path is required.")
-    if input_path.resolve() == output_path.resolve():
-        raise ValueError("Input and output paths must be different.")
-
+@_publish_output
+def run_log_conversion(request: LogConversionRequest, callbacks=None, cancel_token=None) -> ConversionResult:
     info = ffprobe_video(request.input_path)
-    total_frames = request.max_frames if request.max_frames is not None else info.frames
-    
-    _emit_status(callbacks, "変換中 (Log素材用・色域拡張パススルー)")
-    
-    # 1. zscaleを使用して、見た目を変えずに色域だけをBT.709からBT.2020に拡張します。
-    # 2. tin=bt709:t=smpte2084 により、Logの階調を維持したままHDR10の器（PQ）へマッピングします。
-    # 3. エラー187を回避するため、全てのパラメータ (p, t, m) を明示的に指定します。
-    vf_chain = (
-        "zscale=pin=bt709:tin=bt709:min=bt709:"
-        "p=bt2020:t=smpte2084:m=bt2020nc:range=tv,"
-        "format=gbrpf32le" if request.encoder == "openexr" else "format=yuv420p10le"
-    )
-
-    # Professional HDR10 Static Metadata (SEI messages)
-    cmd = [
-        "ffmpeg", "-y", "-i", request.input_path,
-        "-vf", vf_chain,
-    ]
-
-    if request.encoder in {"prores_422hq", "prores_4444"}:
-        is_4444 = request.encoder == "prores_4444"
-        prores_encoder = "prores_videotoolbox" if is_videotoolbox_available() else "prores_ks"
-        cmd += [
-            "-c:v", prores_encoder,
-            "-profile:v", "4" if is_4444 else "3",
-            "-pix_fmt", "p410le" if is_4444 and prores_encoder == "prores_videotoolbox" else (
-                "yuv444p10le" if is_4444 else "yuv422p10le"
-            ),
-            "-color_primaries", "bt2020",
-            "-color_trc", "smpte2084",
-            "-colorspace", "bt2020nc",
-            "-movflags", "+write_colr",
-            "-c:a", "copy",
-        ]
-    elif request.encoder == "openexr":
-        cmd += [
-            "-f", "image2",
-            "-c:v", "exr",
-            "-format", "half",
-            "-compression", "zip16",
-            "-pix_fmt", "gbrpf32le",
-        ]
-    else:
-        x265_params = (
-            "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
-            "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):"
-            "max-cll=1000,400:hdr10=1"
-        )
-        cmd += [
-            "-c:v", "libx265",
-            "-crf", "10",
-            "-preset", "medium",
-            "-tag:v", "hvc1",
-            "-x265-params", x265_params,
-            "-c:a", "copy",
-        ]
-        
+    total = request.max_frames if request.max_frames is not None else info.frames
+    profile = X265_PROFILE_DEFAULTS[request.x265_mode]
+    cmd = build_log_encoder_command(request.output_path, request.input_path, info, request.encoder,
+                                    request.x265_preset or profile["preset"],
+                                    request.x265_crf if request.x265_crf is not None else profile["crf"])
     if request.max_frames is not None:
-        cmd.extend(["-frames:v", str(request.max_frames)])
-        
-    cmd.append(request.output_path)
-    
-    import subprocess
-    import re
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    
-    processed = 0
-    cancelled = False
-    start = time.monotonic()
-    frame_re = re.compile(r"frame=\s*(\d+)")
-    
-    try:
-        assert process.stderr is not None
-        for line in process.stderr:
-            if cancel_token and cancel_token.cancel_requested:
-                cancelled = True
-                _emit_status(callbacks, "キャンセル中")
-                _terminate_process(process)
-                break
-                
-            match = frame_re.search(line)
-            if match:
-                processed = int(match.group(1))
-                elapsed = max(time.monotonic() - start, 1e-6)
-                fps = processed / elapsed
-                _emit_progress(callbacks, processed, total_frames, fps)
-                
-        process.wait()
-    except Exception as exc:
-        _terminate_process(process)
-        _emit_error(callbacks, str(exc))
-        raise
-    finally:
-        _wait_terminated_process(process)
-        
-    if cancelled:
-        if not request.keep_partial_output_on_cancel or processed == 0:
-            try:
-                os.remove(request.output_path)
-            except FileNotFoundError:
-                pass
-        result = ConversionResult(
-            output_path=request.output_path,
-            processed_frames=processed,
-            total_frames=total_frames,
-            cancelled=True,
-        )
-        _emit_complete(callbacks, result)
-        return result
-        
-    if process.returncode != 0:
-        raise RuntimeError(f"FFmpegがエラーコード {process.returncode} で終了しました。")
-        
-    if request.encoder in HDR10_ENCODERS and request.verify_hdr_metadata and not has_expected_hdr_metadata(request.output_path):
-        _emit_status(callbacks, "HDRメタデータが不足しています。タグを修復中...")
-        restamp_hdr_metadata(request.output_path)
-        
-    result = ConversionResult(output_path=request.output_path, processed_frames=processed, total_frames=total_frames)
-    _emit_status(callbacks, "完了")
-    _emit_complete(callbacks, result)
-    return result
+        cmd[-1:-1] = ["-frames:v", str(request.max_frames)]
+    _emit_status(callbacks, "動画Logを変換中")
+    processed, cancelled = _run_ffmpeg(cmd, callbacks, cancel_token, total)
+    if not cancelled:
+        if processed == 0:
+            raise RuntimeError("No frames were processed.")
+        if request.encoder == "openexr_acescg":
+            stamp_ap1_exr_sequence(request.output_path, processed, 100.0)
+        elif request.encoder in PRORES_ENCODERS:
+            restamp_prores_metadata(request.output_path)
+        elif request.encoder in HDR10_ENCODERS and request.verify_hdr_metadata:
+            restamp_hdr_metadata(request.output_path)
+    return ConversionResult(request.output_path, processed, total, cancelled)
 
 
+@_publish_output
 def run_image_conversion(
     request: ImageConversionRequest,
     callbacks: ConversionCallbacks | None = None,
@@ -799,75 +963,45 @@ def run_image_conversion(
     processor = SDRToHDRProcessor(config, enhancer=HeuristicEnhancer())
     processor.enhancer = build_enhancer(request, processor.torch_device)
     
+    if cancel_token and cancel_token.cancel_requested:
+        return ConversionResult(request.output_path, 0, 1, True)
     _emit_status(callbacks, "画像を読み込み中")
     img_bgr8 = load_image(request.input_path)
     
     _emit_status(callbacks, "AI処理中")
     hdr_rgb48 = processor.process_frame(img_bgr8)
     
+    if cancel_token and cancel_token.cancel_requested:
+        return ConversionResult(request.output_path, 1, 1, True)
     _emit_status(callbacks, "HDR画像を保存中")
-    save_image_hdr(request.output_path, hdr_rgb48, peak_nits=config.peak_nits)
+    saved = save_image_hdr(request.output_path, hdr_rgb48, peak_nits=config.peak_nits,
+                           cancel_check=(lambda: cancel_token.cancel_requested) if cancel_token else None)
+    if not saved:
+        return ConversionResult(request.output_path, 1, 1, True)
     
     result = ConversionResult(output_path=request.output_path, processed_frames=1, total_frames=1)
-    _emit_status(callbacks, "完了")
     _emit_complete(callbacks, result)
     return result
 
 
-def run_image_log_conversion(
-    request: ImageLogConversionRequest,
-    callbacks: ConversionCallbacks | None = None,
-    cancel_token: CancelToken | None = None,
-) -> ConversionResult:
-    _emit_status(callbacks, "変換中 (静止画 Logパススルー)")
-    
-    vf_chain = (
-        "zscale=pin=bt709:tin=bt709:min=bt709:"
-        "p=bt2020:t=smpte2084:m=bt2020nc:range=tv,"
-        "format=yuv420p10le"
-    )
-    
-    ext = Path(request.output_path).suffix.lower()
-    
-    cmd = ["ffmpeg", "-y", "-i", request.input_path]
-    
-    if ext == ".jxl":
-        cmd += [
-            "-vf", vf_chain,
-            "-c:v", "libjxl",
-            "-color_primaries", "bt2020",
-            "-color_trc", "smpte2084",
-            "-colorspace", "bt2020nc",
-        ]
-    elif ext == ".avif":
-        cmd += [
-            "-vf", vf_chain,
-            "-c:v", "libaom-av1",
-            "-still-picture", "1",
-            "-pix_fmt", "yuv420p10le",
-            "-color_primaries", "bt2020",
-            "-color_trc", "smpte2084",
-            "-colorspace", "bt2020nc",
-        ]
-    else:
-        # Default to high quality TIFF if unknown
-        cmd += [
-            "-vf", "zscale=pin=bt709:tin=bt709:min=bt709:p=bt2020:t=smpte2084:m=bt2020nc:range=tv,format=rgb48le",
-            "-c:v", "tiff",
-            "-color_primaries", "bt2020",
-            "-color_trc", "smpte2084",
-            "-colorspace", "bt2020nc",
-        ]
-
-    cmd.append(request.output_path)
-    
-    import subprocess
-    result_proc = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result_proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg image conversion failed: {result_proc.stderr}")
-        
-    result = ConversionResult(output_path=request.output_path, processed_frames=1, total_frames=1)
-    _emit_status(callbacks, "完了")
-    _emit_complete(callbacks, result)
-    return result
+@_publish_output
+def run_image_log_conversion(request: ImageLogConversionRequest, callbacks=None, cancel_token=None) -> ConversionResult:
+    from sdr2hdr.io import save_image_hdr
+    import numpy as np
+    info = ffprobe_video(request.input_path)
+    _emit_status(callbacks, "画像Logを変換中")
+    # Use the same RGB16 input to the TIFF/JXL/AVIF saver as image AI mode.
+    raw = Path(request.output_path).parent / "image.rgb48"
+    cmd = ["ffmpeg", "-v", "error", "-i", request.input_path,
+           "-vf", log_output_filter(rgb_input=(info.pix_fmt or "").startswith(("rgb", "bgr", "gbr"))), "-frames:v", "1",
+           "-f", "rawvideo", "-pix_fmt", "rgb48le", str(raw)]
+    _, cancelled = _run_ffmpeg(cmd, callbacks, cancel_token, 1)
+    if cancelled:
+        return ConversionResult(request.output_path, 0, 1, True)
+    expected = info.width * info.height * 6
+    if not raw.is_file() or raw.stat().st_size != expected:
+        raise RuntimeError("Image conversion returned an incomplete RGB frame.")
+    pixels = np.fromfile(raw, dtype="<u2").reshape(info.height, info.width, 3)
+    saved = save_image_hdr(request.output_path, pixels,
+                           cancel_check=(lambda: cancel_token.cancel_requested) if cancel_token else None)
+    return ConversionResult(request.output_path, 1, 1, not saved)

@@ -6,6 +6,8 @@ import platform
 import cv2
 import numpy as np
 
+from .output_color import ACES_OUTPUTS, HLG_ENCODER, OutputColorTransform
+
 from sdr2hdr.ai import (
     BaseEnhancer,
     EnhancementGuidance,
@@ -423,6 +425,10 @@ def _torch_compile_available() -> bool:
 class SDRToHDRProcessor:
     def __init__(self, config: ProcessorConfig, enhancer: BaseEnhancer | None = None) -> None:
         self.config = config
+        self.output_transform = (
+            OutputColorTransform(config.output_color_space, config.peak_nits)
+            if config.output_color_space in {*ACES_OUTPUTS, HLG_ENCODER} else None
+        )
         self.enhancer = enhancer or HeuristicEnhancer()
         self.state = TemporalState()
         self.torch_device = self._resolve_torch_device()
@@ -1032,6 +1038,8 @@ class SDRToHDRProcessor:
             # FFmpeg gbrpf32le stores planar G, B, R, not R, G, B.
             return acescg_t[..., [1, 2, 0]].permute(2, 0, 1).to(torch.float32).cpu().numpy()
 
+        if self.output_transform is not None:
+            return self.output_transform.render(frame_nits_t.cpu().numpy())
         frame_pq_t = linear_nits_to_pq_torch(frame_nits_t)
         return torch.clamp(torch.round(frame_pq_t * 65535.0), 0, 65535).to(torch.uint16).cpu().numpy()
 
@@ -1240,6 +1248,8 @@ class SDRToHDRProcessor:
             # Preserve linear values, including values above 1, in GBR plane order.
             return np.transpose(frame_acescg[..., [1, 2, 0]].astype(np.float32), (2, 0, 1))
 
+        if self.output_transform is not None:
+            return self.output_transform.render(frame_nits, (original_width, original_height))
         frame_pq = linear_nits_to_pq(frame_nits)
         frame_16 = np.clip(np.round(frame_pq * 65535.0), 0, 65535).astype(np.uint16)
         if frame_16.shape[:2] != frame_bgr8.shape[:2]:

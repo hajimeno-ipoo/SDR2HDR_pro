@@ -15,6 +15,26 @@ from sdr2hdr.gui import (
 
 
 class GuiTests(unittest.TestCase):
+    def test_open_output_resolves_exr_sequence_to_existing_folder(self) -> None:
+        gui = SDR2HDRGUI.__new__(SDR2HDRGUI)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "frame_000001.exr").touch()
+            gui.last_output_path = str(root / "frame_%06d.exr")
+            self.assertFalse(Path(gui.last_output_path).exists())
+            with patch("sdr2hdr.gui.open_path") as opener:
+                gui._open_output()
+            opener.assert_called_once_with(str(root))
+            self.assertTrue(Path(opener.call_args.args[0]).is_dir())
+
+    def test_open_output_keeps_single_file_paths(self) -> None:
+        gui = SDR2HDRGUI.__new__(SDR2HDRGUI)
+        for path in ("/output/movie.mov", "/output/still.exr", "/folder_%06d/still.exr"):
+            with self.subTest(path=path), patch("sdr2hdr.gui.open_path") as opener:
+                gui.last_output_path = path
+                gui._open_output()
+                opener.assert_called_once_with(path)
+
     def test_build_encoder_options_for_windows(self) -> None:
         options = build_encoder_options("Windows")
         self.assertIn("libx265", options)
@@ -23,7 +43,7 @@ class GuiTests(unittest.TestCase):
         self.assertIn("prores_4444", options)
         self.assertIn("openexr", options)
         self.assertIn("openexr_acescg", options)
-        self.assertEqual(options["openexr_acescg"], "OpenEXR 16-bit AP1線形連番（表示基準）")
+        self.assertEqual(options["openexr_acescg"], "OpenEXR（表示基準AP1線形）")
         self.assertNotIn("hevc_videotoolbox", options)
 
     def test_build_encoder_options_for_macos(self) -> None:

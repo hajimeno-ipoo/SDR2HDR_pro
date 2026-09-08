@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 from pathlib import Path
 
@@ -28,8 +29,11 @@ class AppTests(unittest.TestCase):
     @mock.patch("sdr2hdr.app.ffprobe_video")
     @mock.patch("sdr2hdr.io.shutil.which", return_value=None)
     def test_ap1_missing_metadata_writer_fails_before_decoding(self, _which, probe) -> None:
-        with self.assertRaisesRegex(ValueError, "exrstdattr"):
-            run_conversion(ConversionRequest("input.mp4", "out_%06d.exr", encoder="openexr_acescg"))
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "input.mp4"
+            source.touch()
+            with self.assertRaisesRegex(ValueError, "exrstdattr"):
+                run_conversion(ConversionRequest(str(source), str(Path(temporary)/"out.zip"), encoder="openexr_acescg"))
         probe.assert_not_called()
 
     @unittest.skipUnless(all(shutil.which(tool) for tool in ("ffmpeg", "exrstdattr", "exrheader")),
@@ -42,12 +46,18 @@ class AppTests(unittest.TestCase):
                 "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=2",
                 "-frames:v", "2", "-c:v", "ffv1", str(source),
             ], check=True)
-            request = ConversionRequest(str(source), str(root / "frame_%06d.exr"),
+            request = ConversionRequest(str(source), str(root / "frames.zip"),
                                         encoder="openexr_acescg", preset="cinema", backend="numpy")
             with mock.patch("sdr2hdr.app.build_enhancer", return_value=HeuristicEnhancer()):
                 result = run_conversion(request)
             self.assertEqual(result.processed_frames, 2)
-            for path in sorted(root.glob("*.exr")):
+            with zipfile.ZipFile(root / "frames.zip") as archive:
+                self.assertEqual(archive.namelist(), ["frame_000001.exr", "frame_000002.exr"])
+                archive.extractall(root / "extracted")
+            self.assertEqual(list(root.glob("*.exr")), [])
+            paths = sorted((root / "extracted").glob("*.exr"))
+            self.assertEqual([path.name for path in paths], ["frame_000001.exr", "frame_000002.exr"])
+            for path in paths:
                 header = subprocess.run(["exrheader", str(path)], check=True,
                                         capture_output=True, text=True).stdout
                 self.assertIn("chromaticities", header)
@@ -75,13 +85,13 @@ class AppTests(unittest.TestCase):
     def test_build_output_path_uses_sequence_pattern_for_openexr(self) -> None:
         self.assertEqual(
             build_output_path("/tmp/example.mp4", encoder="openexr"),
-            str(Path("/tmp/example_hdr_%06d.exr")),
+            str(Path("/tmp/example_hdr.zip")),
         )
 
     def test_build_output_path_uses_sequence_pattern_for_acescg_openexr(self) -> None:
         self.assertEqual(
             build_output_path("/tmp/example.mp4", encoder="openexr_acescg"),
-            str(Path("/tmp/example_hdr_%06d.exr")),
+            str(Path("/tmp/example_hdr.zip")),
         )
 
     def test_acescg_encoder_selects_linear_output_color_space(self) -> None:

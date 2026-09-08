@@ -15,11 +15,18 @@ from .app import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SDR 動画を HDR10 に変換します。")
+    parser = argparse.ArgumentParser(description="SDR 動画を HDR に変換します。")
     parser.add_argument("input_path", help="入力 SDR 動画のパス")
     parser.add_argument("output_path", nargs="?", help="出力 HDR 動画のパス")
     parser.add_argument("--preset", choices=sorted(PRESETS), default="natural")
-    parser.add_argument("--encoder", default="libx265")
+    parser.add_argument(
+        "--encoder", default="libx265",
+        help="libx265, hevc_videotoolbox, hevc_nvenc, hevc_hlg, prores_422hq, "
+             "prores_4444, prores_4444_xq, openexr, openexr_acescg, "
+             "openexr_acescg_1_3, openexr_acescg_2_0",
+    )
+    parser.add_argument("--exr-delivery", choices=["zip", "video"], default="zip",
+                        help="EXR出力をZIP連番またはBT.2020/PQのProRes 4444動画で保存")
     parser.add_argument("--x265-mode", choices=sorted(X265_PROFILE_DEFAULTS), default="balanced")
     parser.add_argument("--backend", choices=["auto", "numpy", "cuda", "mps"], default="auto")
     parser.add_argument("--device", default="auto")
@@ -59,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    output_path = args.output_path or build_output_path(args.input_path)
+    output_path = args.output_path or build_output_path(args.input_path, encoder=args.encoder, exr_delivery=args.exr_delivery)
     model_path = str(Path(args.model_path))
     if Path(model_path).suffix.lower() != ".pt":
         parser.error("--model-path は .pt の TorchScript モデルを指定する必要があります。")
@@ -69,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path=output_path,
         preset=args.preset,
         encoder=args.encoder,
+        exr_delivery=args.exr_delivery,
         x265_mode=args.x265_mode,
         backend=args.backend,
         device=args.device,

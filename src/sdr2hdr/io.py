@@ -6,12 +6,18 @@ import re
 import shlex
 import shutil
 import subprocess
+import struct
+import sys
 import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import cv2
+
+from .output_color import ACES_OUTPUTS, EXR_ENCODERS, HLG_ENCODER
 
 
 @dataclass
@@ -25,13 +31,13 @@ class VideoInfo:
     field_order: str | None
 
 
-def ffprobe_first_audio_codec(path: str) -> str | None:
+def ffprobe_audio_codecs(path: str) -> list[str]:
     cmd = [
         "ffprobe",
         "-v",
         "error",
         "-select_streams",
-        "a:0",
+        "a",
         "-show_entries",
         "stream=codec_name",
         "-of",
@@ -41,9 +47,12 @@ def ffprobe_first_audio_codec(path: str) -> str | None:
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     payload = json.loads(result.stdout)
     streams = payload.get("streams", [])
-    if not streams:
-        return None
-    return streams[0].get("codec_name")
+    return [stream.get("codec_name", "unknown") for stream in streams]
+
+
+def ffprobe_first_audio_codec(path: str) -> str | None:
+    codecs = ffprobe_audio_codecs(path)
+    return codecs[0] if codecs else None
 
 
 def ffprobe_video(path: str) -> VideoInfo:
@@ -105,7 +114,7 @@ def open_decoder(path: str, info: VideoInfo) -> subprocess.Popen[bytes]:
         "0",
         "-",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return start_logged_process(cmd, stdout=subprocess.PIPE)
 
 
 def build_audio_output_args(output_path: str, source_path: str) -> list[str]:
@@ -150,7 +159,7 @@ def is_prores_4444_xq_available() -> bool:
     return "p416le" in result.stdout and "4444 XQ" in result.stdout
 
 
-def open_encoder(
+def build_encoder_command(
     output_path: str,
     source_path: str,
     info: VideoInfo,
@@ -158,7 +167,7 @@ def open_encoder(
     encoder: str = "hevc_videotoolbox",
     x265_preset: str = "medium",
     x265_crf: int = 16,
-) -> subprocess.Popen[bytes]:
+) -> list[str]:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     mastering = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
     max_cll = f"{int(peak_nits)},{max(int(peak_nits * 0.4), 1)}"
@@ -170,7 +179,7 @@ def open_encoder(
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "gbrpf32le" if encoder == "openexr_acescg" else "rgb48le",
+        "gbrpf32le" if encoder in {"openexr_acescg", *ACES_OUTPUTS} else "rgb48le",
         "-s",
         f"{info.width}x{info.height}",
         "-r",
@@ -178,7 +187,7 @@ def open_encoder(
         "-i",
         "-",
     ]
-    if encoder not in {"openexr", "openexr_acescg"}:
+    if encoder not in EXR_ENCODERS:
         cmd += [
             "-i",
             source_path,
@@ -187,7 +196,7 @@ def open_encoder(
             "-map",
             "1:a?",
         ]
-    audio_args = build_audio_output_args(output_path, source_path) if encoder not in {"openexr", "openexr_acescg"} else []
+    audio_args = build_audio_output_args(output_path, source_path) if encoder not in EXR_ENCODERS else []
     if encoder == "hevc_videotoolbox":
         cmd += [
             "-pix_fmt",
@@ -259,6 +268,7 @@ def open_encoder(
         cmd += [
             "-c:v",
             enc_name,
+            "-vf", "scale=in_color_matrix=bt2020:out_color_matrix=bt2020",
             "-profile:v",
             profile_val,
             "-pix_fmt",
@@ -275,7 +285,7 @@ def open_encoder(
         if enc_name == "prores_videotoolbox":
             cmd[cmd.index("-movflags"):cmd.index("-movflags")] = ["-allow_sw", "1"]
         cmd += audio_args + [output_path]
-    elif encoder in {"openexr", "openexr_acescg"}:
+    elif encoder in EXR_ENCODERS:
         cmd += [
             "-f",
             "image2",
@@ -286,11 +296,11 @@ def open_encoder(
             "-compression",
             "zip16",
             "-pix_fmt",
-            "gbrpf32le" if encoder == "openexr_acescg" else "rgb48le",
+            "gbrpf32le" if encoder in {"openexr_acescg", *ACES_OUTPUTS} else "rgb48le",
             "-metadata",
-            "colorspace=ACEScg" if encoder == "openexr_acescg" else "colorspace=BT.2020/PQ",
+            "colorspace=ACEScg" if encoder in {"openexr_acescg", *ACES_OUTPUTS} else "colorspace=BT.2020/PQ",
         ]
-        if encoder == "openexr_acescg":
+        if encoder in {"openexr_acescg", *ACES_OUTPUTS}:
             cmd += ["-color_trc", "linear"]
         else:
             cmd += [
@@ -302,6 +312,16 @@ def open_encoder(
                 "bt2020nc",
             ]
         cmd.append(output_path)
+    elif encoder == HLG_ENCODER:
+        cmd += [
+            "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+            "-vf", "scale=in_color_matrix=bt2020:out_color_matrix=bt2020",
+            "-tag:v", "hvc1", "-preset", x265_preset, "-crf", str(x265_crf),
+            "-x265-params", "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+            "-color_primaries", "bt2020", "-color_trc", "arib-std-b67",
+            "-colorspace", "bt2020nc",
+        ]
+        cmd += audio_args + [output_path]
     else:
         cmd += [
             "-c:v",
@@ -326,7 +346,63 @@ def open_encoder(
             "bt2020nc",
         ]
         cmd += audio_args + [output_path]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    return cmd
+
+
+def start_logged_process(cmd: list[str], **kwargs) -> subprocess.Popen:
+    # A file cannot fill a pipe and block FFmpeg while frame queues are full.
+    log = tempfile.TemporaryFile()
+    try:
+        process = subprocess.Popen(cmd, stderr=log, **kwargs)
+    except BaseException:
+        log.close()
+        raise
+    process._stderr_log = log
+    return process
+
+
+def open_encoder(
+    output_path: str, source_path: str, info: VideoInfo, peak_nits: float,
+    encoder: str = "hevc_videotoolbox", x265_preset: str = "medium", x265_crf: int = 16,
+) -> subprocess.Popen[bytes]:
+    cmd = build_encoder_command(output_path, source_path, info, peak_nits,
+                                encoder, x265_preset, x265_crf)
+    return start_logged_process(cmd, stdin=subprocess.PIPE)
+
+
+def log_output_filter(*, linear_ap1: bool = False, rgb_input: bool = False) -> str:
+    # Preserve the existing Log mode's BT.709 input interpretation and 100-nit
+    # zscale reference. This mode does not decode camera-specific Log curves.
+    matrix_in = "gbr" if rgb_input else "bt709"
+    prefix = f"zscale=pin=bt709:tin=bt709:min={matrix_in}:p=bt2020:"
+    if linear_ap1:
+        from sdr2hdr.core import REC2020_TO_ACESCG
+        names = ("rr", "rg", "rb", "gr", "gg", "gb", "br", "bg", "bb")
+        matrix = ":".join(f"{name}={float(value):.12g}" for name, value in
+                          zip(names, REC2020_TO_ACESCG.flat))
+        return prefix + "t=linear:m=gbr:range=pc:npl=100,format=gbrpf32le,colorchannelmixer=" + matrix
+    return prefix + "t=smpte2084:m=gbr:range=pc:npl=100,format=gbrp16le,format=rgb48le"
+
+
+def build_log_encoder_command(output_path: str, source_path: str, info: VideoInfo,
+                              encoder: str, preset: str, crf: int) -> list[str]:
+    cmd = build_encoder_command(output_path, source_path, info, 1000, encoder, preset, crf)
+    # Reuse the selected codec, precision, audio and colour-tag options.
+    # Replace only the raw-frame input by the original video and its Log filter.
+    end = cmd.index("-map") if encoder not in EXR_ENCODERS else cmd.index("-f", 5)
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", source_path] + cmd[end:]
+    if encoder not in EXR_ENCODERS:
+        cmd[cmd.index("1:a?")] = "0:a?"
+    filters = log_output_filter(linear_ap1=encoder == "openexr_acescg",
+                                rgb_input=(info.pix_fmt or "").startswith(("rgb", "bgr", "gbr")))
+    if "-vf" in cmd:
+        index = cmd.index("-vf")
+        cmd[index + 1] = filters + "," + cmd[index + 1] + ":out_range=tv"
+    else:
+        if encoder not in EXR_ENCODERS:
+            filters += ",scale=in_color_matrix=bt2020:out_color_matrix=bt2020:out_range=tv"
+        cmd[-1:-1] = ["-vf", filters]
+    return cmd
 
 
 def read_frame(process: subprocess.Popen[bytes], width: int, height: int) -> np.ndarray | None:
@@ -339,19 +415,24 @@ def read_frame(process: subprocess.Popen[bytes], width: int, height: int) -> np.
 
 
 def finalize_process(process: subprocess.Popen[bytes], name: str, allow_broken_pipe: bool = False) -> None:
-    stderr = b""
     if process.stdin is not None:
         try:
             process.stdin.close()
         except BrokenPipeError:
-            if not allow_broken_pipe:
-                raise
+            pass  # Report FFmpeg's diagnostic below instead of losing it.
     if process.stdout is not None:
         process.stdout.close()
-    if process.stderr is not None:
-        stderr = process.stderr.read()
-        process.stderr.close()
-    return_code = process.wait()
+    log = getattr(process, "_stderr_log", None)
+    if log is not None:
+        return_code = process.wait()
+        log.seek(0)
+        stderr = log.read()
+        log.close()
+    else:
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        if process.stderr is not None:
+            process.stderr.close()
+        return_code = process.wait()
     rendered = stderr.decode("utf-8", errors="replace").strip()
     if allow_broken_pipe and return_code != 0 and "Broken pipe" in rendered:
         return
@@ -370,9 +451,10 @@ def require_exr_metadata_tool() -> str:
     return tool
 
 
-def stamp_ap1_exr_sequence(pattern: str, frame_count: int, white_luminance: float) -> None:
-    """Tag only the frames just written, preserving their encoded pixel values."""
-    tool = require_exr_metadata_tool()
+def exr_sequence_paths(pattern: str, frame_count: int) -> list[Path]:
+    """Resolve exactly the frame names written by FFmpeg (numbering starts at 1)."""
+    if frame_count == 0:
+        return []
     output = Path(pattern)
     tokens = list(re.finditer(r"%0?(\d*)d", output.name))
     if len(tokens) != 1:
@@ -384,6 +466,33 @@ def stamp_ap1_exr_sequence(pattern: str, frame_count: int, white_luminance: floa
         width = int(token.group(1) or 0)
         paths = [output.with_name(output.name[:token.start()] + str(index).zfill(width)
                                   + output.name[token.end():]) for index in range(1, frame_count + 1)]
+    return paths
+
+
+def stamp_ap1_exr_sequence(
+    pattern: str, frame_count: int, white_luminance: float,
+    *, aces_output: str | None = None,
+) -> None:
+    """Tag only this conversion's frames, without changing encoded pixels."""
+    tool = require_exr_metadata_tool()
+    paths = exr_sequence_paths(pattern, frame_count)
+    if aces_output is None:
+        attributes = [
+            "-whiteLuminance", str(float(white_luminance)),
+            "-string", "colorInteropID", "unknown",
+            "-comments", "Display-referred linear AP1 / ACES white. "
+            "Tone-mapped SDR conversion; not recovered scene exposure. "
+            "whiteLuminance specifies nits at RGB (1,1,1).",
+        ]
+    else:
+        config_name, view = ACES_OUTPUTS[aces_output]
+        attributes = [
+            "-string", "colorInteropID", "lin_ap1_scene",
+            "-string", "ocioConfig", config_name,
+            "-string", "ocioInverseView", view,
+            "-comments", "ACEScg from inverse ACES output transform of graded SDR. "
+            "Reference display: Rec.2100-PQ, 1000 nit. Not recovered camera exposure.",
+        ]
     for path in paths:
         if not path.is_file():
             raise RuntimeError(f"Missing EXR frame: {path}")
@@ -393,15 +502,93 @@ def stamp_ap1_exr_sequence(pattern: str, frame_count: int, white_luminance: floa
             subprocess.run([
                 tool, "-chromaticities", "0.713", "0.293", "0.165", "0.830",
                 "0.128", "0.044", "0.32168", "0.33767",
-                "-whiteLuminance", str(float(white_luminance)),
-                # AP1 here is display-referred, not the scene-referred lin_ap1_scene ID.
-                "-string", "colorInteropID", "unknown",
-                "-comments", "Display-referred linear AP1 / ACES white. "
-                "Tone-mapped SDR conversion; not recovered scene exposure. "
-                "whiteLuminance specifies nits at RGB (1,1,1).",
+                *attributes,
                 str(path), str(tagged),
             ], check=True, capture_output=True)
             tagged.replace(path)
+
+
+def _stamp_prores_mov_colr(path: Path) -> None:
+    """Update colr only inside ProRes visual sample entries, never media payload.
+
+    FFmpeg 7.1 VideoToolbox can supply an unspecified colr atom even when output
+    colour options and ProRes frame headers are set. Walk QuickTime atom lengths
+    rather than searching arbitrary compressed data for a byte sequence.
+    """
+    offsets: list[int] = []
+    with path.open("r+b") as stream:
+        def atoms(start: int, end: int):
+            while start < end:
+                stream.seek(start)
+                header = stream.read(8)
+                if len(header) != 8:
+                    raise ValueError("Truncated MOV atom header")
+                size, kind = struct.unpack(">I4s", header)
+                header_size = 8
+                if size == 1:
+                    extended = stream.read(8)
+                    if len(extended) != 8:
+                        raise ValueError("Truncated MOV extended size")
+                    size = struct.unpack(">Q", extended)[0]
+                    header_size = 16
+                elif size == 0:
+                    size = end - start
+                if size < header_size or start + size > end:
+                    raise ValueError("Invalid MOV atom size")
+                yield kind, start + header_size, start + size
+                start += size
+
+        def sample_colours(sample: int, sample_end: int, *, nested: bool = False) -> None:
+            if nested:
+                stream.seek(sample_end - 4)
+                if stream.read(4) == b"\x00\x00\x00\x00":
+                    sample_end -= 4  # QuickTime sample-description terminator.
+            # VisualSampleEntry has 78 bytes after its atom header.
+            for extension, data, data_end in atoms(sample + 78, sample_end):
+                if extension == b"colr":
+                    stream.seek(data)
+                    if data_end - data < 10 or stream.read(4) not in {b"nclc", b"nclx"}:
+                        raise ValueError("Unsupported ProRes MOV colour atom")
+                    offsets.append(data + 4)
+                elif extension == b"glbl" and not nested:
+                    # VideoToolbox extradata contains another sample description.
+                    for codec, embedded, embedded_end in atoms(data, data_end):
+                        if codec in {b"apch", b"ap4h", b"ap4x"}:
+                            sample_colours(embedded, embedded_end, nested=True)
+
+        def walk(start: int, end: int) -> None:
+            for kind, payload, limit in atoms(start, end):
+                if kind in {b"moov", b"trak", b"mdia", b"minf", b"stbl"}:
+                    walk(payload, limit)
+                elif kind == b"stsd":
+                    if payload + 8 > limit:
+                        raise ValueError("Invalid MOV sample description")
+                    for codec, sample, sample_end in atoms(payload + 8, limit):
+                        if codec not in {b"apch", b"ap4h", b"ap4x"}:
+                            continue
+                        sample_colours(sample, sample_end)
+
+        walk(0, path.stat().st_size)
+        if not offsets:
+            raise ValueError("ProRes MOV has no colour atom")
+        for offset in offsets:
+            stream.seek(offset)
+            stream.write(struct.pack(">HHH", 9, 16, 9))  # BT.2020 / PQ / BT.2020 NCL
+
+
+def restamp_prores_metadata(path: str) -> None:
+    """Set both ProRes frame headers and MOV colour atoms, with atomic replacement."""
+    source = Path(path)
+    with tempfile.TemporaryDirectory(prefix=".prores-metadata-", dir=source.parent) as directory:
+        output = Path(directory) / "tagged.mov"
+        subprocess.run([
+            "ffmpeg", "-v", "error", "-i", str(source), "-map", "0", "-c", "copy",
+            "-bsf:v", "prores_metadata=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+            "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+            "-colorspace", "bt2020nc", "-movflags", "+write_colr", str(output),
+        ], check=True, capture_output=True)
+        _stamp_prores_mov_colr(output)
+        output.replace(source)
 
 
 def restamp_hdr_metadata(path: str, max_cll: int | None = None, max_fall: int | None = None) -> None:
@@ -413,26 +600,16 @@ def restamp_hdr_metadata(path: str, max_cll: int | None = None, max_fall: int | 
     
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v?", "-map", "0:a?"]
     if max_cll is not None and max_fall is not None:
-        mastering = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
-        x265_params = (
-            "hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:"
-            f"colormatrix=bt2020nc:master-display={mastering}:"
-            f"max-cll={max(int(max_cll), 1)},{max(int(max_fall), 1)}"
-        )
-        cmd += [
-            "-c:v",
-            "libx265",
-            "-preset",
-            "medium",
-            "-crf",
-            "0",
-            "-pix_fmt",
-            "yuv420p10le",
-            "-tag:v",
-            "hvc1",
-            "-x265-params",
-            x265_params,
-        ]
+        try:
+            # Isolate PyAV's bundled FFmpeg from OpenCV's macOS AVFoundation classes.
+            subprocess.run([
+                sys.executable, "-m", "sdr2hdr.hevc_metadata", str(source), str(temp_path),
+                str(max_cll), str(max_fall),
+            ], check=True, capture_output=True)
+            temp_path.replace(source)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return
     else:
         cmd += [
             "-c:v",
@@ -443,6 +620,7 @@ def restamp_hdr_metadata(path: str, max_cll: int | None = None, max_fall: int | 
             "hevc_metadata=colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9",
         ]
     cmd += [
+        "-c:a", "copy",
         "-movflags",
         "+faststart",
         "-color_primaries",
@@ -501,12 +679,80 @@ def load_image(path: str) -> np.ndarray:
     return img
 
 
+def require_ultrahdr_tool() -> str:
+    executable = shutil.which("ultrahdr_app")
+    if executable is None:
+        raise ValueError("HDR JPEGの保存にはlibultrahdrのultrahdr_appが必要です。macOSでは brew install libultrahdr で導入できます。")
+    return executable
+
+
+def _save_jpeg_hdr(output_path, image_rgb48, cancel_check) -> bool:
+    executable = require_ultrahdr_tool()
+    h, w = image_rgb48.shape[:2]
+    # libultrahdr v1.4: full-range PQ, BT.2100, little-endian RGBA1010102.
+    rgb = np.rint(image_rgb48.astype(np.float64) * (1023.0 / 65535.0)).astype(np.uint32)
+    packed = rgb[..., 0] | (rgb[..., 1] << 10) | (rgb[..., 2] << 20) | np.uint32(3 << 30)
+    with tempfile.TemporaryDirectory(prefix=".ultrahdr-", dir=Path(output_path).parent) as directory:
+        raw = Path(directory) / "hdr.raw"
+        encoded = Path(directory) / "hdr.jpg"
+        packed.astype("<u4").tofile(raw)
+        cmd = [executable, "-m", "0", "-p", str(raw), "-w", str(w), "-h", str(h),
+               "-a", "5", "-C", "2", "-t", "2", "-R", "1", "-q", "95", "-Q", "95",
+               "-s", "1", "-M", "1", "-z", str(encoded)]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            while True:
+                if cancel_check and cancel_check():
+                    process.kill()
+                    process.communicate()
+                    return False
+                try:
+                    log, _ = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
+        if process.returncode or not encoded.is_file() or not encoded.stat().st_size:
+            raise RuntimeError("HDR JPEGの保存に失敗しました: " + log.decode("utf-8", errors="replace"))
+        if cancel_check and cancel_check():
+            return False
+        encoded.replace(output_path)
+    return True
+
+
+def _tag_hdr_png(output_path: str) -> None:
+    """Write PNG Third Edition cICP before IDAT; preserve encoded RGB16 samples."""
+    path = Path(output_path)
+    data = path.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError("PNG encoder returned an invalid file.")
+    parts = [data[:8]]
+    offset = 8
+    while offset < len(data):
+        length = struct.unpack_from(">I", data, offset)[0]
+        kind = data[offset + 4:offset + 8]
+        chunk = data[offset:offset + 12 + length]
+        if kind != b"cICP":
+            parts.append(chunk)
+        if kind == b"IHDR":
+            payload = b"cICP" + bytes((9, 16, 0, 1))  # BT.2020, PQ, RGB, full range.
+            parts.append(struct.pack(">I", 4) + payload + struct.pack(">I", zlib.crc32(payload)))
+        offset += 12 + length
+    path.write_bytes(b"".join(parts))
+
+
 def save_image_hdr(
     output_path: str,
     image_rgb48: np.ndarray,
     peak_nits: float = 1000.0,
-) -> None:
-    """Saves a 16-bit RGB image as a HDR static image (AVIF or JXL or TIFF)."""
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
+    """Save BT.2020/PQ RGB16 as an HDR still image."""
+    if Path(output_path).suffix.lower() in {".jpg", ".jpeg"}:
+        return _save_jpeg_hdr(output_path, image_rgb48, cancel_check)
     h, w = image_rgb48.shape[:2]
     mastering = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
     max_cll = f"{int(peak_nits)},{max(int(peak_nits * 0.4), 1)}"
@@ -521,9 +767,13 @@ def save_image_hdr(
         "-i", "-",
     ]
     
-    if ext == ".jxl":
+    if ext == ".png":
+        cmd += ["-c:v", "png", "-pix_fmt", "rgb48be", "-frames:v", "1",
+                "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+                "-colorspace", "rgb", "-color_range", "pc"]
+    elif ext == ".jxl":
         cmd += [
-            "-c:v", "libjxl",
+            "-c:v", "libjxl", "-distance", "0", "-pix_fmt", "rgb48le",
             "-color_primaries", "bt2020",
             "-color_trc", "smpte2084",
             "-colorspace", "bt2020nc",
@@ -548,18 +798,35 @@ def save_image_hdr(
             "-colorspace", "bt2020nc",
         ]
     else:
-        # Default to JXL if unknown
-        cmd += ["-c:v", "libjxl"]
+        raise ValueError(f"Unsupported image output extension: {ext}")
 
     cmd.append(output_path)
     
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        process.communicate(input=image_rgb48.tobytes())
+        data = image_rgb48.tobytes()
+        while True:
+            if cancel_check and cancel_check():
+                process.terminate()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                return False
+            try:
+                _, stderr = process.communicate(input=data, timeout=0.1 if cancel_check else None)
+                break
+            except subprocess.TimeoutExpired:
+                data = None  # communicate resumes the input it already buffered.
     except Exception as exc:
         process.kill()
+        process.communicate()
         raise RuntimeError(f"FFmpeg image encoding failed: {exc}")
     
     if process.returncode != 0:
-        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else "Unknown error"
+        stderr = stderr.decode("utf-8", errors="replace")
         raise RuntimeError(f"FFmpeg image encoding failed with code {process.returncode}: {stderr}")
+    if ext == ".png":
+        _tag_hdr_png(output_path)
+    return True

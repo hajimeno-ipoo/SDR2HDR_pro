@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import platform
 import queue
+import re
 import subprocess
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -28,6 +29,8 @@ from sdr2hdr.app import (
     run_image_conversion,
     run_image_log_conversion,
     validate_request,
+    validate_export_request,
+    output_extensions,
 )
 
 X265_MODE_OPTIONS = {
@@ -36,31 +39,46 @@ X265_MODE_OPTIONS = {
     "final": "最終 (最高品質)",
 }
 
+EXR_DELIVERY_OPTIONS = {
+    "zip": "EXR連番のZIP",
+    "video": "HDR動画（ProRes 4444 / MOV）",
+}
+
 MODELS_DIR = Path.cwd() / "models"
 
 
-def describe_mode_hint(encoder: str, mode: str, backend: str, preset: str, model_path: str) -> str:
-    if encoder == "hevc_videotoolbox":
-        return "サポートされている Mac では最速です。失敗した場合は libx265 にフォールバックします。"
-    if encoder == "hevc_nvenc":
-        return "サポートされている NVIDIA GPU では最速です。失敗した場合は libx265 にフォールバックします。"
-    if mode == "preview":
-        speed = "最速の x265 モード。圧縮効率は低くなります。"
-    elif mode == "final":
-        speed = "最も遅い x265 モード。最高の圧縮品質。"
-    else:
-        speed = "日常使い向けのバランス型 x265 モード。"
-    if model_path.strip():
-        if backend == "cuda":
-            return speed + " NVIDIA GPU で学習済みマップモードが有効です。"
-        if backend == "mps":
-            return speed + " Apple GPU で学習済みマップモードが有効です。"
-        return speed + " 学習済みマップモードが有効です。"
-    if backend == "mps":
-        return speed + " Apple GPU を使用します。"
-    if backend == "cuda":
-        return speed + " 処理に NVIDIA GPU を使用します。"
-    return speed
+def describe_mode_hint(encoder: str, mode: str, backend: str, preset: str, model_path: str, exr_delivery: str = "zip") -> str:
+    if exr_delivery == "video" and encoder.startswith("openexr"):
+        if encoder in {"openexr_acescg_1_3", "openexr_acescg_2_0"}:
+            version = "1.3" if encoder.endswith("1_3") else "2.0"
+            return f"ACES {version}の公式出力変換でBT.2020/PQのHDR動画へ変換します。ACEScgを保持する場合はZIPを選んでください。"
+        if encoder == "openexr_acescg":
+            return "表示基準のAP1線形データをBT.2020/PQへ変換してHDR動画で保存します。AP1線形データを保持する場合はZIPを選んでください。音声も動画に含めます。"
+        return "BT.2020/PQのEXR連番をHDR動画として保存します。音声も動画に含めます。"
+    descriptions = {
+        "prores_422hq": "編集用のProRes 422 HQをMOVで保存します。入力精度は10bit、色はBT.2020/PQです。",
+        "prores_4444": "編集用のProRes 4444をMOVで保存します。このアプリの入力精度は10bitです。色はBT.2020/PQです。",
+        "prores_4444_xq": "ProRes 4444 XQを12bit精度でMOV保存します。対応するMacとFFmpegが必要です。色はBT.2020/PQです。",
+        "openexr": "BT.2020/PQのEXR連番を、音声があれば音声ファイルと一緒に1つのZIPへ保存します。",
+        "openexr_acescg": "表示基準のAP1線形EXR連番をZIPへ保存します。撮影時の光量を復元する形式ではありません。音声があれば同梱します。",
+        "openexr_acescg_1_3": "ACES 1.3の公式出力変換を逆変換したACEScgのEXR連番をZIPへ保存します。音声があれば同梱します。",
+        "openexr_acescg_2_0": "ACES 2.0の公式出力変換を逆変換したACEScgのEXR連番をZIPへ保存します。音声があれば同梱します。",
+        "hevc_hlg": "HEVC/H.265の10bit HLG動画です。基準ピークは1000 nitです。速度/品質で圧縮設定を選べます。",
+        "hevc_videotoolbox": "MacのVideoToolboxでHEVC/H.265の10bit PQ動画を保存します。",
+        "hevc_nvenc": "NVIDIA GPUのNVENCでHEVC/H.265の10bit PQ動画を保存します。",
+        "libx265": "CPUでHEVC/H.265の10bit PQ動画を保存します。速度/品質で圧縮設定を選べます。",
+    }
+    return descriptions.get(encoder, "")
+
+
+def describe_image_format(extension: str) -> str:
+    return {
+        ".jpg": "Ultra HDR JPEGで保存します。10bit PQ入力からHDR復元用のゲインマップを生成します。非可逆圧縮です。非対応アプリではSDR表示になります。",
+        ".png": "16bit RGBのPNGでロスレス保存します。BT.2020/PQの色情報を記録します。HDR表示には対応アプリが必要です。",
+        ".tif": "16bit RGBのTIFFで保存します。画素はBT.2020/PQです。FFmpegのTIFF色情報の記録には制限があります。",
+        ".jxl": "16bit RGBのJPEG XLで保存します。HDR変換後の画素をロスレス圧縮します。色はBT.2020/PQです。",
+        ".avif": "10bitのAVIFで保存します。圧縮により画素値が変わる閲覧向けの形式です。色はBT.2020/PQです。",
+    }[extension]
 
 
 def format_ai_strength(value: float) -> str:
@@ -69,17 +87,20 @@ def format_ai_strength(value: float) -> str:
 def build_encoder_options(system_name: str | None = None) -> dict[str, str]:
     system_name = system_name or platform.system()
     options = {
-        "libx265": "libx265 (高品質)",
-        "prores_422hq": "Apple ProRes 422 HQ (10-bit)",
-        "prores_4444": "Apple ProRes 4444 profile (10-bit)",
-        "openexr": "OpenEXR 16-bit 連番",
-        "openexr_acescg": "OpenEXR 16-bit AP1線形連番（表示基準）",
+        "libx265": "HEVC / H.265（CPU）",
+        "prores_422hq": "Apple ProRes 422 HQ（MOV / 10bit）",
+        "prores_4444": "Apple ProRes 4444（MOV / 10bit入力）",
+        "openexr": "OpenEXR（BT.2020/PQ）",
+        "openexr_acescg": "OpenEXR（表示基準AP1線形）",
+        "openexr_acescg_1_3": "OpenEXR ACEScg（ACES 1.3）",
+        "openexr_acescg_2_0": "OpenEXR ACEScg（ACES 2.0）",
+        "hevc_hlg": "HEVC 10-bit HLG（基準1000 nit）",
     }
     if system_name == "Darwin":
-        options["prores_4444_xq"] = "Apple ProRes 4444 XQ (12-bit)"
-        options["hevc_videotoolbox"] = "VideoToolbox (Macで高速)"
+        options["prores_4444_xq"] = "Apple ProRes 4444 XQ（MOV / 12bit）"
+        options["hevc_videotoolbox"] = "HEVC / H.265（Mac）"
     elif system_name == "Windows":
-        options["hevc_nvenc"] = "NVENC (NVIDIAで高速)"
+        options["hevc_nvenc"] = "HEVC / H.265（NVIDIA）"
     return options
 
 
@@ -92,6 +113,11 @@ def build_backend_options(system_name: str | None = None) -> dict[str, str]:
         options["cuda"] = "CUDA (NVIDIA GPU)"
     options["numpy"] = "CPU / NumPy"
     return options
+
+
+def is_exr_sequence(path: str) -> bool:
+    output = Path(path)
+    return output.suffix.lower() == ".exr" and re.search(r"%0?\d*d", output.name) is not None
 
 
 def open_path(path: str) -> None:
@@ -157,6 +183,8 @@ class SDR2HDRGUI:
         self.cancel_token: CancelToken | None = None
         self.last_output_path: str | None = None
         self.queue_jobs: list[QueueJob] = []
+        self._input_batches = {}
+        self._path_labels = {}
         self.current_job_index: int | None = None
 
         self.system_name = platform.system()
@@ -179,6 +207,10 @@ class SDR2HDRGUI:
         self.status_var = tk.StringVar(value="待機中")
         self.progress_var = tk.StringVar(value="0 フレーム")
         self.mode_hint_var = tk.StringVar(value="")
+        self.log_mode_hint_var = tk.StringVar(value="")
+        self.img_mode_hint_var = tk.StringVar(value="")
+        self.img_log_mode_hint_var = tk.StringVar(value="")
+        self._output_path_state = {}
         self.saturation_var = tk.DoubleVar(value=1.05)
         self.saturation_label_var = tk.StringVar(value="1.05x")
         self.hdr_guidance_var = tk.StringVar(value="auto")
@@ -189,6 +221,8 @@ class SDR2HDRGUI:
         self.log_output_var = tk.StringVar()
         self.log_encoder_var = tk.StringVar(value=self.encoder_options[default_encoder])
         self.log_x265_mode_var = tk.StringVar(value=X265_MODE_OPTIONS["balanced"])
+        self.exr_delivery_var = tk.StringVar(value=EXR_DELIVERY_OPTIONS["zip"])
+        self.log_exr_delivery_var = tk.StringVar(value=EXR_DELIVERY_OPTIONS["zip"])
         
         # Image用の変数
         self.img_input_var = tk.StringVar()
@@ -197,7 +231,7 @@ class SDR2HDRGUI:
         self.img_log_output_var = tk.StringVar()
         
         # 画像出力形式
-        self.img_format_options = {".tif": "TIFF (16-bit / 編集用)", ".jxl": "JPEG XL (ロスレス / 保存用)", ".avif": "AVIF (高圧縮 / 閲覧用)"}
+        self.img_format_options = {".tif": "TIFF (16-bit / 編集用)", ".jxl": "JPEG XL (ロスレス / 保存用)", ".avif": "AVIF (高圧縮 / 閲覧用)", ".jpg": "JPEG (Ultra HDR / ゲインマップ)", ".png": "PNG (16-bit / HDR / ロスレス)"}
         self.img_format_var = tk.StringVar(value=self.img_format_options[".tif"])
         self.img_log_format_var = tk.StringVar(value=self.img_format_options[".tif"])
 
@@ -252,8 +286,10 @@ class SDR2HDRGUI:
 
         controls = ttk.Frame(left)
         controls.grid(row=1, column=0, sticky="ew", pady=(16, 12))
+        self.add_queue_button = ttk.Button(controls, text="キューに追加", command=self._enqueue_current)
+        self.add_queue_button.pack(side="left")
         self.start_button = ttk.Button(controls, text="キュー開始", command=self._start)
-        self.start_button.pack(side="left")
+        self.start_button.pack(side="left", padx=(8, 0))
         self.stop_button = ttk.Button(controls, text="現在の処理を停止", command=self._stop)
         self.stop_button.pack(side="left", padx=(8, 0))
         self.open_output_button = ttk.Button(controls, text="出力を開く", command=self._open_output)
@@ -274,12 +310,8 @@ class SDR2HDRGUI:
 
         queue_controls = ttk.Frame(right)
         queue_controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.add_queue_button = ttk.Button(queue_controls, text="キューに追加", command=self._enqueue_current)
-        self.add_queue_button.pack(side="left")
-        self.add_files_button = ttk.Button(queue_controls, text="ファイルを追加", command=self._enqueue_files)
-        self.add_files_button.pack(side="left", padx=(8, 0))
         self.remove_queue_button = ttk.Button(queue_controls, text="選択項目を削除", command=self._remove_selected_job)
-        self.remove_queue_button.pack(side="left", padx=(8, 0))
+        self.remove_queue_button.pack(side="left")
         self.clear_queue_button = ttk.Button(queue_controls, text="キューをクリア", command=self._clear_queue)
         self.clear_queue_button.pack(side="left", padx=(8, 0))
 
@@ -303,6 +335,10 @@ class SDR2HDRGUI:
         self.encoder_var.trace_add("write", self._sync_output_path)
         self.log_encoder_var.trace_add("write", self._sync_log_encoder_ui)
         self.log_encoder_var.trace_add("write", self._sync_log_output_path)
+        self.exr_delivery_var.trace_add("write", self._sync_encoder_ui)
+        self.exr_delivery_var.trace_add("write", self._sync_output_path)
+        self.log_exr_delivery_var.trace_add("write", self._sync_log_encoder_ui)
+        self.log_exr_delivery_var.trace_add("write", self._sync_log_output_path)
         self.x265_mode_var.trace_add("write", self._sync_mode_hint)
         self.backend_var.trace_add("write", self._sync_mode_hint)
         self.backend_var.trace_add("write", self._refresh_model_choices)
@@ -320,6 +356,8 @@ class SDR2HDRGUI:
         self._sync_saturation_label()
         self._sync_mode_hint()
         self._sync_preset_description()
+        self._sync_img_output_path()
+        self._sync_img_log_output_path()
         self._refresh_job_list()
 
     def _build_ai_tab(self, tab: ttk.Frame) -> None:
@@ -332,8 +370,11 @@ class SDR2HDRGUI:
         self.preset_desc_label = ttk.Label(tab, text="", font=("Helvetica", 9), foreground="#555", wraplength=400)
         self.preset_desc_label.grid(row=3, column=1, sticky="w", pady=(0, 8), padx=2)
 
-        self.encoder_combo = self._add_combo_row(tab, 4, "エンコーダー", self.encoder_var, list(self.encoder_options.values()))
+        self.encoder_combo = self._add_format_row(tab, 4, "出力形式", self.encoder_var, list(self.encoder_options.values()), self.mode_hint_var)
+        self.encoder_combo.grid_configure(sticky="ew")
         self.x265_combo = self._add_combo_row(tab, 5, "速度/品質", self.x265_mode_var, list(X265_MODE_OPTIONS.values()))
+        self.x265_row_widgets = tab.grid_slaves(row=5)
+        self.exr_delivery_row, self.exr_delivery_combo = self._add_exr_delivery_row(tab, 5, self.exr_delivery_var)
         self.backend_combo = self._add_combo_row(tab, 6, "バックエンド", self.backend_var, list(self.backend_options.values()))
         self.model_combo = self._add_combo_row(
             tab, 7, "AI モデル", self.model_name_var,
@@ -366,7 +407,6 @@ class SDR2HDRGUI:
         ttk.Label(tab, text="AIがどれだけ積極的に輝度を拡張するかを調整します。値を上げるとより眩しいHDRになりますが、上げすぎると不自然な階調になる場合があります。", 
                   font=("Helvetica", 9), foreground="#555", wraplength=400).grid(row=10, column=1, sticky="w", pady=(0, 4))
 
-        ttk.Label(tab, textvariable=self.mode_hint_var, wraplength=400, font=("Helvetica", 9, "bold")).grid(row=11, column=1, sticky="w", pady=(0, 8))
 
     def _build_log_tab(self, tab: ttk.Frame) -> None:
         tab.columnconfigure(1, weight=1)
@@ -374,14 +414,20 @@ class SDR2HDRGUI:
                   font=("Helvetica", 10), foreground="#666").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
         self.log_input_entry = self._add_path_row(tab, 1, "入力 (Log)", self.log_input_var, self._browse_log_input)
         self.log_output_entry = self._add_path_row(tab, 2, "出力 (HDR)", self.log_output_var, self._browse_log_output)
-        self.log_encoder_combo = self._add_combo_row(tab, 3, "エンコーダー", self.log_encoder_var, list(self.encoder_options.values()))
+        log_options = [label for key, label in self.encoder_options.items()
+                       if key not in {"hevc_hlg", "openexr_acescg_1_3", "openexr_acescg_2_0"}]
+        self.log_encoder_combo = self._add_format_row(
+            tab, 3, "出力形式", self.log_encoder_var, log_options, self.log_mode_hint_var,
+        )
         self.log_x265_combo = self._add_combo_row(tab, 4, "速度/品質", self.log_x265_mode_var, list(X265_MODE_OPTIONS.values()))
+        self.log_x265_row_widgets = tab.grid_slaves(row=4)
+        self.log_exr_delivery_row, self.log_exr_delivery_combo = self._add_exr_delivery_row(tab, 4, self.log_exr_delivery_var)
 
     def _build_img_ai_tab(self, tab: ttk.Frame) -> None:
         tab.columnconfigure(1, weight=1)
         self.img_input_entry = self._add_path_row(tab, 0, "入力 (Image)", self.img_input_var, self._browse_img_input)
         self.img_output_entry = self._add_path_row(tab, 1, "出力 (HDR)", self.img_output_var, self._browse_img_output)
-        self._add_combo_row(tab, 2, "出力形式", self.img_format_var, list(self.img_format_options.values()))
+        self._add_format_row(tab, 2, "出力形式", self.img_format_var, list(self.img_format_options.values()), self.img_mode_hint_var)
         self._add_combo_row(tab, 3, "プリセット", self.preset_var, list(get_presets().keys()))
         
         # プリセット説明用（動画タブと共有変数）
@@ -419,7 +465,7 @@ class SDR2HDRGUI:
                   font=("Helvetica", 10), foreground="#666").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
         self.img_log_input_entry = self._add_path_row(tab, 1, "入力 (Image)", self.img_log_input_var, self._browse_img_log_input)
         self.img_log_output_entry = self._add_path_row(tab, 2, "出力 (HDR)", self.img_log_output_var, self._browse_img_log_output)
-        self._add_combo_row(tab, 3, "出力形式", self.img_log_format_var, list(self.img_format_options.values()))
+        self._add_format_row(tab, 3, "出力形式", self.img_log_format_var, list(self.img_format_options.values()), self.img_log_mode_hint_var)
 
 
     def _add_path_row(
@@ -430,7 +476,9 @@ class SDR2HDRGUI:
         variable: tk.StringVar,
         browse_command: object,
     ) -> ttk.Entry:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+        path_label = ttk.Label(parent, text=label)
+        path_label.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+        self._path_labels[str(variable)] = (path_label, label)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", pady=6)
         ttk.Button(parent, text="参照", command=browse_command).grid(row=row, column=2, padx=(8, 0))
@@ -449,25 +497,71 @@ class SDR2HDRGUI:
         combo.grid(row=row, column=1, sticky="w", pady=6)
         return combo
 
+    def _add_format_row(self, parent, row, label, variable, values, description):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="nw", pady=6, padx=(0, 12))
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=1, sticky="ew", pady=6)
+        frame.columnconfigure(0, weight=1)
+        combo = ttk.Combobox(frame, textvariable=variable, values=values, state="readonly")
+        combo.grid(row=0, column=0, sticky="ew")
+        hint = ttk.Label(frame, textvariable=description, wraplength=400, foreground="#555")
+        hint.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        frame.bind("<Configure>", lambda event: hint.configure(wraplength=max(1, event.width)))
+        return combo
+
+    def _add_exr_delivery_row(self, parent, row, variable):
+        label = ttk.Label(parent, text="保存方法")
+        label.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+        combo = ttk.Combobox(parent, textvariable=variable, values=list(EXR_DELIVERY_OPTIONS.values()), state="readonly", width=30)
+        combo.grid(row=row, column=1, sticky="ew", pady=6)
+        return (label, combo), combo
+
+    def _selected_exr_delivery(self, log_mode=False):
+        variable = self.log_exr_delivery_var if log_mode else self.exr_delivery_var
+        return next(key for key, label in EXR_DELIVERY_OPTIONS.items() if label == variable.get())
+
+    def _sync_exr_delivery_ui(self, log_mode=False):
+        row = self.log_exr_delivery_row if log_mode else self.exr_delivery_row
+        combo = self.log_exr_delivery_combo if log_mode else self.exr_delivery_combo
+        encoder = self._selected_log_encoder() if log_mode else self._selected_encoder()
+        quality_widgets = self.log_x265_row_widgets if log_mode else self.x265_row_widgets
+        exr = encoder.startswith("openexr")
+        for widget in row:
+            widget.grid() if exr else widget.grid_remove()
+        for widget in quality_widgets:
+            widget.grid_remove() if exr else widget.grid()
+        running = self.state in {AppState.RUNNING, AppState.CANCELLING}
+        combo.configure(state="disabled" if running else "readonly")
+
+    def _sync_path(self, key, input_var, output_var, extension):
+        source = input_var.get().strip()
+        current = output_var.get().strip()
+        batch = getattr(self, "_input_batches", {}).get(key)
+        if batch and source == batch[0]:
+            return  # A batch output is a folder, unaffected by format changes.
+        if batch:
+            del self._input_batches[key]
+            widget, label = self._path_labels[str(output_var)]
+            widget.configure(text=label)
+            current = str(Path(current) / Path(build_output_path(source, extension=extension)).name) if current and source else ""
+            output_var.set(current)
+        previous_source, previous_auto = self._output_path_state.get(key, ("", ""))
+        automatic = not current or current == previous_auto
+        if automatic and source and (source != previous_source or not current):
+            updated = build_output_path(source, extension=extension)
+        elif current:
+            updated = str(Path(current).with_suffix(extension))
+        else:
+            updated = ""
+        self._output_path_state[key] = (source, updated if automatic else "")
+        if updated != current:
+            output_var.set(updated)
+
     def _sync_output_path(self, *_: object) -> None:
-        if not self.input_var.get():
-            return
-        current = self.output_var.get().strip()
-        if not current or current == self.last_output_path:
-            self.last_output_path = build_output_path(
-                self.input_var.get(), encoder=self._selected_encoder()
-            )
-            self.output_var.set(self.last_output_path)
+        self._sync_path("video_ai", self.input_var, self.output_var, output_extensions(self._selected_encoder(), self._selected_exr_delivery())[0])
 
     def _sync_log_output_path(self, *_: object) -> None:
-        if not self.log_input_var.get():
-            return
-        current = self.log_output_var.get().strip()
-        if not current or current == self.last_output_path:
-            self.last_output_path = build_output_path(
-                self.log_input_var.get(), encoder=self._selected_log_encoder()
-            )
-            self.log_output_var.set(self.last_output_path)
+        self._sync_path("video_log", self.log_input_var, self.log_output_var, output_extensions(self._selected_log_encoder(), self._selected_exr_delivery(log_mode=True))[0])
 
     def _sync_preset_description(self, *_: object) -> None:
         descriptions = get_preset_descriptions()
@@ -485,31 +579,26 @@ class SDR2HDRGUI:
         return ".tif"
 
     def _sync_img_output_path(self, *_: object) -> None:
-        if not self.img_input_var.get():
-            return
-        current = self.img_output_var.get().strip()
-        if not current or current == self.last_output_path:
-            ext = self._selected_img_format(log_mode=False)
-            self.last_output_path = build_output_path(self.img_input_var.get(), extension=ext)
-            self.img_output_var.set(self.last_output_path)
+        ext = self._selected_img_format()
+        self._sync_path("image_ai", self.img_input_var, self.img_output_var, ext)
+        self.img_mode_hint_var.set(describe_image_format(ext))
 
     def _sync_img_log_output_path(self, *_: object) -> None:
-        if not self.img_log_input_var.get():
-            return
-        current = self.img_log_output_var.get().strip()
-        if not current or current == self.last_output_path:
-            ext = self._selected_img_format(log_mode=True)
-            self.last_output_path = build_output_path(self.img_log_input_var.get(), extension=ext)
-            self.img_log_output_var.set(self.last_output_path)
+        ext = self._selected_img_format(log_mode=True)
+        self._sync_path("image_log", self.img_log_input_var, self.img_log_output_var, ext)
+        self.img_log_mode_hint_var.set(describe_image_format(ext))
 
     def _sync_encoder_ui(self, *_: object) -> None:
-        if self._selected_encoder() == "libx265":
+        self._sync_exr_delivery_ui()
+        if self._selected_encoder() in {"libx265", "hevc_hlg"}:
             self.x265_combo.configure(state="readonly")
         else:
             self.x265_combo.configure(state="disabled")
         self._sync_mode_hint()
 
     def _sync_log_encoder_ui(self, *_: object) -> None:
+        self._sync_exr_delivery_ui(log_mode=True)
+        self.log_mode_hint_var.set(describe_mode_hint(self._selected_log_encoder(), self._selected_log_x265_mode(), "", "", "", self._selected_exr_delivery(log_mode=True)))
         if self._selected_log_encoder() == "libx265":
             self.log_x265_combo.configure(state="readonly")
         else:
@@ -523,6 +612,7 @@ class SDR2HDRGUI:
                 self._selected_backend(),
                 self.preset_var.get(),
                 self.model_path_var.get(),
+                self._selected_exr_delivery(),
             )
         )
 
@@ -591,65 +681,68 @@ class SDR2HDRGUI:
                 return key
         return "auto"
 
+    def _browse_inputs(self, key, input_var, output_var, image=False):
+        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+            return
+        pattern = "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.heic *.avif" if image else "*.mp4 *.mov *.mkv *.m2ts *.mts"
+        paths = filedialog.askopenfilenames(title="入力ファイルを選択（複数選択可）", filetypes=[("画像" if image else "動画", pattern), ("すべてのファイル", "*.*")])
+        if not paths:
+            return
+        if len(paths) == 1:
+            input_var.set(paths[0])
+            return
+        was_batch = key in self._input_batches
+        current = output_var.get().strip()
+        folder = current if was_batch else str(Path(current).parent) if current else str(Path(paths[0]).parent)
+        display = f"{len(paths)}件: " + "; ".join(paths)
+        self._input_batches[key] = (display, tuple(paths))
+        input_var.set(display)
+        output_var.set(folder)
+        self._path_labels[str(output_var)][0].configure(text="保存先フォルダー")
+
     def _browse_input(self) -> None:
-        path = filedialog.askopenfilename(title="入力動画を選択", filetypes=[("動画ファイル", "*.mp4 *.mov *.mkv *.m2ts *.mts"), ("すべてのファイル", "*.*")])
+        self._browse_inputs("video_ai", self.input_var, self.output_var)
+
+    def _browse_selected_output(self, variable, extension, key):
+        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+            return
+        current = Path(variable.get()) if variable.get().strip() else None
+        if key in self._input_batches:
+            path = filedialog.askdirectory(title="保存先フォルダーを選択", initialdir=str(current) if current else None)
+            if path:
+                variable.set(path)
+            return
+        path = filedialog.asksaveasfilename(
+            title="出力を保存", defaultextension=extension,
+            filetypes=[(extension.lstrip(".").upper(), "*" + extension)],
+            initialdir=str(current.parent) if current else None,
+            initialfile=current.name if current else None,
+        )
         if path:
-            self.input_var.set(path)
+            variable.set(str(Path(path).with_suffix(extension)))
+            # A selected save location is manual even if it matches the default.
+            self._output_path_state[key] = (self._output_path_state.get(key, ("", ""))[0], "")
 
     def _browse_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="出力動画を保存",
-            defaultextension=".mp4",
-            filetypes=[("MP4ファイル", "*.mp4"), ("すべてのファイル", "*.*")],
-        )
-        if path:
-            self.output_var.set(path)
-            self.last_output_path = path
+        self._browse_selected_output(self.output_var, output_extensions(self._selected_encoder(), self._selected_exr_delivery())[0], "video_ai")
 
     def _browse_log_input(self) -> None:
-        path = filedialog.askopenfilename(title="入力動画を選択 (Log)", filetypes=[("動画ファイル", "*.mp4 *.mov *.mkv *.m2ts *.mts"), ("すべてのファイル", "*.*")])
-        if path:
-            self.log_input_var.set(path)
+        self._browse_inputs("video_log", self.log_input_var, self.log_output_var, image=False)
 
     def _browse_log_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="出力動画を保存 (HDR)",
-            defaultextension=".mp4",
-            filetypes=[("MP4ファイル", "*.mp4"), ("すべてのファイル", "*.*")],
-        )
-        if path:
-            self.log_output_var.set(path)
-            self.last_output_path = path
+        self._browse_selected_output(self.log_output_var, output_extensions(self._selected_log_encoder(), self._selected_exr_delivery(log_mode=True))[0], "video_log")
 
     def _browse_img_input(self) -> None:
-        path = filedialog.askopenfilename(title="入力画像を選択", filetypes=[("画像ファイル", "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.heic *.avif"), ("すべてのファイル", "*.*")])
-        if path:
-            self.img_input_var.set(path)
+        self._browse_inputs("image_ai", self.img_input_var, self.img_output_var, image=True)
 
     def _browse_img_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="出力画像を保存",
-            defaultextension=".jxl",
-            filetypes=[("JPEG XL", "*.jxl"), ("TIFF", "*.tif"), ("AVIF", "*.avif"), ("すべてのファイル", "*.*")],
-        )
-        if path:
-            self.img_output_var.set(path)
-            self.last_output_path = path
+        self._browse_selected_output(self.img_output_var, self._selected_img_format(), "image_ai")
 
     def _browse_img_log_input(self) -> None:
-        path = filedialog.askopenfilename(title="入力画像を選択 (Log)", filetypes=[("画像ファイル", "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.heic *.avif"), ("すべてのファイル", "*.*")])
-        if path:
-            self.img_log_input_var.set(path)
+        self._browse_inputs("image_log", self.img_log_input_var, self.img_log_output_var, image=True)
 
     def _browse_img_log_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="出力画像を保存 (HDR)",
-            defaultextension=".jxl",
-            filetypes=[("JPEG XL", "*.jxl"), ("TIFF", "*.tif"), ("AVIF", "*.avif"), ("すべてのファイル", "*.*")],
-        )
-        if path:
-            self.img_log_output_var.set(path)
-            self.last_output_path = path
+        self._browse_selected_output(self.img_log_output_var, self._selected_img_format(log_mode=True), "image_log")
 
     def _refresh_available_models(self) -> None:
         self.available_models = list_available_models()
@@ -686,13 +779,14 @@ class SDR2HDRGUI:
                 output_path=self.output_var.get().strip(),
                 preset=self.preset_var.get(),
                 encoder=self._selected_encoder(),
+                exr_delivery=self._selected_exr_delivery(),
                 x265_mode=self._selected_x265_mode(),
                 backend=self._selected_backend(),
                 model_path=self.model_path_var.get().strip() or None,
                 ai_strength=self.ai_strength_var.get() if self.model_path_var.get().strip() else None,
                 device="auto",
                 fallback_to_x265_on_hardware_error=True,
-                keep_partial_output_on_cancel=True,
+                keep_partial_output_on_cancel=False,
                 saturation=self.saturation_var.get(),
                 hdr_guidance=self.hdr_guidance_var.get(),
                 luminance_guidance_strength=self.luminance_guidance_var.get(),
@@ -703,8 +797,9 @@ class SDR2HDRGUI:
                 input_path=self.log_input_var.get().strip(),
                 output_path=self.log_output_var.get().strip(),
                 encoder=self._selected_log_encoder(),
+                exr_delivery=self._selected_exr_delivery(log_mode=True),
                 x265_mode=self._selected_log_x265_mode(),
-                keep_partial_output_on_cancel=True,
+                keep_partial_output_on_cancel=False,
             )
         elif tab_idx == 2:  # Image AI
             return ImageConversionRequest(
@@ -728,6 +823,12 @@ class SDR2HDRGUI:
             raise ValueError("入力パスが指定されていません。")
         if not request.output_path:
             raise ValueError("出力パスが指定されていません。")
+        validate_export_request(request)
+        if isinstance(request, (ImageConversionRequest, ImageLogConversionRequest)):
+            selected = self._selected_img_format(log_mode=isinstance(request, ImageLogConversionRequest))
+            actual = Path(request.output_path).suffix.lower()
+            if actual != selected and (selected, actual) not in {(".tif", ".tiff"), (".jpg", ".jpeg")}:
+                raise ValueError(f"選択した画像形式には {selected} の拡張子が必要です。")
         if isinstance(request, (ConversionRequest, ImageConversionRequest)):
             validate_request(request)
 
@@ -767,75 +868,38 @@ class SDR2HDRGUI:
 
     def _enqueue_current(self) -> None:
         try:
-            self._enqueue_request(self._build_request())
+            self._enqueue_inputs()
         except ValueError as exc:
             messagebox.showerror("キューに追加できません", str(exc))
 
-    def _enqueue_files(self) -> None:
-        tab_idx = self.notebook.index("current")
-        is_image = tab_idx >= 2
-        
-        if is_image:
-            filetypes = [("画像ファイル", "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.heic *.avif"), ("すべてのファイル", "*.*")]
-            title = "入力画像を選択"
-        else:
-            filetypes = [("動画ファイル", "*.mp4 *.mov *.mkv *.m2ts *.mts"), ("すべてのファイル", "*.*")]
-            title = "入力動画を選択"
-
-        paths = filedialog.askopenfilenames(title=title, filetypes=filetypes)
-        if not paths:
+    def _enqueue_inputs(self):
+        template = self._build_request()
+        index = self.notebook.index("current")
+        key = ("video_ai", "video_log", "image_ai", "image_log")[index]
+        batch = getattr(self, "_input_batches", {}).get(key)
+        if not batch:
+            self._enqueue_request(template)
             return
-        for raw_path in paths:
-            input_path = str(raw_path)
-            selected_encoder = self._selected_encoder() if tab_idx == 0 else self._selected_log_encoder()
-            output_path = build_output_path(input_path, encoder=selected_encoder)
-            
-            if tab_idx == 0:
-                request: Any = ConversionRequest(
-                    input_path=input_path,
-                    output_path=output_path,
-                    preset=self.preset_var.get(),
-                    encoder=selected_encoder,
-                    x265_mode=self._selected_x265_mode(),
-                    backend=self._selected_backend(),
-                    model_path=self.model_path_var.get().strip() or None,
-                    ai_strength=self.ai_strength_var.get() if self.model_path_var.get().strip() else None,
-                    device="auto",
-                    fallback_to_x265_on_hardware_error=True,
-                    keep_partial_output_on_cancel=True,
-                    saturation=self.saturation_var.get(),
-                    hdr_guidance=self.hdr_guidance_var.get(),
-                    luminance_guidance_strength=self.luminance_guidance_var.get(),
-                    reconstruction_strength=self.reconstruction_strength_var.get(),
-                )
-            elif tab_idx == 1:
-                request = LogConversionRequest(
-                    input_path=input_path,
-                    output_path=output_path,
-                    encoder=selected_encoder,
-                    x265_mode=self._selected_log_x265_mode(),
-                    keep_partial_output_on_cancel=True,
-                )
-            elif tab_idx == 2:
-                ext = self._selected_img_format(log_mode=False)
-                output_path = build_output_path(input_path, extension=ext)
-                request = ImageConversionRequest(
-                    input_path=input_path,
-                    output_path=output_path,
-                    preset=self.preset_var.get(),
-                    backend=self._selected_backend(),
-                    model_path=self.model_path_var.get().strip() or None,
-                    ai_strength=self.ai_strength_var.get() if self.model_path_var.get().strip() else None,
-                    device="auto",
-                    saturation=self.saturation_var.get(),
-                )
-            else:
-                ext = self._selected_img_format(log_mode=True)
-                output_path = build_output_path(input_path, extension=ext)
-                request = ImageLogConversionRequest(
-                    input_path=input_path,
-                    output_path=output_path,
-                )
+        if not template.output_path:
+            raise ValueError("保存先フォルダーを指定してください。")
+        folder = Path(template.output_path)
+        if folder.exists() and not folder.is_dir():
+            raise ValueError("複数ファイルの保存先にはフォルダーを指定してください。")
+        extension = self._selected_img_format(log_mode=index == 3) if index >= 2 else output_extensions(template.encoder, template.exr_delivery)[0]
+        requests = []
+        used = {Path(job.request.output_path).resolve() for job in self.queue_jobs}
+        for source in batch[1]:
+            name = Path(build_output_path(source, extension=extension)).name
+            destination = folder / name
+            number = 2
+            while destination.resolve() in used or destination.exists():
+                destination = folder / f"{Path(name).stem}_{number}{extension}"
+                number += 1
+            request = replace(template, input_path=source, output_path=str(destination))
+            self._validate_request(request)
+            used.add(destination.resolve())
+            requests.append(request)
+        for request in requests:
             self._enqueue_request(request)
 
     def _selected_job_indices(self) -> list[int]:
@@ -912,7 +976,7 @@ class SDR2HDRGUI:
             return
         if not self.queue_jobs:
             try:
-                self._enqueue_request(self._build_request())
+                self._enqueue_inputs()
             except ValueError as exc:
                 messagebox.showerror("開始できません", str(exc))
                 return
@@ -933,7 +997,8 @@ class SDR2HDRGUI:
     def _open_output(self) -> None:
         if not self.last_output_path:
             return
-        open_path(self.last_output_path)
+        output = Path(self.last_output_path)
+        open_path(str(output.parent) if is_exr_sequence(self.last_output_path) else self.last_output_path)
 
     def _open_folder(self) -> None:
         if not self.last_output_path:
@@ -957,7 +1022,6 @@ class SDR2HDRGUI:
         self.start_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
         self.add_queue_button.configure(state="disabled" if running else "normal")
-        self.add_files_button.configure(state="disabled" if running else "normal")
         self.remove_queue_button.configure(state="disabled" if running else "normal")
         self.clear_queue_button.configure(state="disabled" if running else "normal")
         self.open_output_button.configure(state="normal" if idle_like and self.last_output_path else "disabled")
@@ -1007,14 +1071,18 @@ class SDR2HDRGUI:
                     self.last_output_path = self.queue_jobs[self.current_job_index].request.output_path
                 if result.cancelled:
                     self.status_var.set("キャンセル済")
-                    self.progress_var.set(f"{result.processed_frames} フレーム処理しました。部分的な出力が保存されました")
-                    self._log("変換がキャンセルされました。部分的な出力が保存されました")
+                    self.progress_var.set(f"{result.processed_frames} フレームで停止しました。今回の未完成出力は破棄しました")
+                    self._log("変換をキャンセルし、今回の未完成出力を破棄しました")
                     self._finish_current_job()
                     self._set_state(AppState.CANCELLED)
                 else:
                     self.status_var.set("完了")
-                    self.progress_var.set(f"{result.processed_frames} フレーム書き出しました")
-                    self._log(f"完了: {Path(result.output_path).name}")
+                    if Path(result.output_path).suffix.lower() == ".zip":
+                        self.progress_var.set(f"EXR画像 {result.processed_frames} 枚をZIPに保存しました")
+                        self._log(f"EXR ZIPの保存先: {result.output_path}")
+                    else:
+                        self.progress_var.set(f"{result.processed_frames} フレーム書き出しました")
+                    self._log(f"完了: {result.output_path}")
                     self._finish_current_job()
                     next_index = self._next_pending_job_index()
                     if next_index is not None:
@@ -1031,7 +1099,6 @@ class SDR2HDRGUI:
                 self.status_var.set("失敗")
                 self.progress_var.set("変換に失敗しました")
                 self._log(str(payload))
-                messagebox.showerror("変換に失敗しました", str(payload))
                 self._finish_current_job()
                 next_index = self._next_pending_job_index()
                 if next_index is not None:
@@ -1039,6 +1106,7 @@ class SDR2HDRGUI:
                     self._start_job(next_index)
                 else:
                     self._set_state(AppState.FAILED)
+                    messagebox.showerror("変換に失敗しました", str(payload))
         self.root.after(100, self._drain_events)
 
 
