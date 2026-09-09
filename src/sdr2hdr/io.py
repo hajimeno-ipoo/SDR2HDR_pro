@@ -31,6 +31,32 @@ class VideoInfo:
     field_order: str | None
 
 
+def ffprobe_comparison(path: str) -> dict:
+    """Read source tags, without replacing absent tags with player guesses."""
+    import av
+
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries",
+        "stream=color_primaries,color_transfer,color_space,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,duration:format=duration",
+        "-of", "json", path,
+    ], check=True, capture_output=True, text=True, timeout=20)
+    payload = json.loads(result.stdout)
+    streams = payload.get("streams", [])
+    if not streams:
+        raise ValueError("映像または画像を読み取れません")
+    info = streams[0]
+    info["duration"] = info.get("duration") or payload.get("format", {}).get("duration")
+    info["bit_depth"] = None
+    if info.get("pix_fmt"):
+        try:
+            components = av.VideoFormat(info["pix_fmt"]).components
+            info["bit_depth"] = max(c.bits for c in components)
+        except (ValueError, TypeError):
+            pass
+    return info
+
+
 def ffprobe_audio_codecs(path: str) -> list[str]:
     cmd = [
         "ffprobe",
@@ -764,6 +790,10 @@ def save_image_hdr(
         "-f", "rawvideo",
         "-pix_fmt", "rgb48le",
         "-s", f"{w}x{h}",
+        # Encoders consume the AVFrame's colour properties. Output-only flags
+        # do not supply those properties to raw RGB frames on all FFmpeg builds.
+        "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+        "-colorspace", "rgb", "-color_range", "pc",
         "-i", "-",
     ]
     
@@ -779,7 +809,19 @@ def save_image_hdr(
             "-colorspace", "bt2020nc",
         ]
     elif ext == ".avif":
+        avif_filter = (
+            "zscale=matrixin=gbr:primariesin=bt2020:transferin=smpte2084:rangein=full:"
+            "matrix=bt2020nc:primaries=bt2020:transfer=smpte2084:range=limited"
+        )
+        if w % 2 or h % 2:
+            # zscale cannot process odd-sized subsampled planes. Convert the
+            # matrix at full chroma resolution, then subsample without resizing.
+            avif_filter += (
+                ",format=yuv444p16le,scale=iw:ih:in_range=limited:out_range=limited,"
+                "format=yuv420p10le"
+            )
         cmd += [
+            "-vf", avif_filter,
             "-c:v", "libaom-av1",
             "-still-picture", "1",
             "-pix_fmt", "yuv420p10le",

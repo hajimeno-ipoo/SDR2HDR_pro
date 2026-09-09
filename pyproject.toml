@@ -12,6 +12,9 @@ dependencies = [
   "opencv-python>=4.10",
   "opencolorio==2.5.2",
   "av>=16,<17",
+  "python-mpv>=1.0.8,<2",
+  "pyobjc-framework-Cocoa>=12,<13; sys_platform == 'darwin'",
+  "pyobjc-framework-Quartz>=12,<13; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

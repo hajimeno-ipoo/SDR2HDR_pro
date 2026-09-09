@@ -48,3 +48,9 @@ graphify-out/
 # Local project instructions and personal development notes
 /AGENTS.md
 /FOR\[hazimeno_ipoo\].md
+
+# Local comparison implementation progress
+/.compare-implementation/
+
+# Compiled native extensions
+*.so

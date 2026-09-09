@@ -50,11 +50,13 @@ class _FakeRoot:
 
 
 class GUIQueueStatusTests(unittest.TestCase):
-    def test_exr_completion_shows_saved_image_count_and_folder(self) -> None:
+    def test_exr_completion_keeps_preview_separate_from_destination(self) -> None:
         app = SDR2HDRGUI.__new__(SDR2HDRGUI)
         output = "/output/frames.zip"
         app.root = _FakeRoot()
-        app.queue_jobs = [QueueJob(request=SimpleNamespace(output_path=output), status="running")]
+        app.last_output_path = None
+        app.queue_jobs = [QueueJob(request=SimpleNamespace(input_path="/input/movie.mp4", output_path="/destination/frames.zip"), status="running")]
+        app.compare_view = Mock()
         app.current_job_index = 0
         app.event_queue = queue.Queue()
         app.event_queue.put(("complete", ConversionResult(output, 240, 240)))
@@ -69,9 +71,9 @@ class GUIQueueStatusTests(unittest.TestCase):
 
         app._drain_events()
 
-        self.assertIn("EXR画像 240 枚をZIPに保存", app.progress_var.get())
-        app._log.assert_any_call("EXR ZIPの保存先: /output/frames.zip")
-        self.assertEqual(app.last_output_path, output)
+        self.assertIn("EXR画像 240 枚のZIPを準備", app.progress_var.get())
+        self.assertEqual(app.queue_jobs[0].preview_path, output)
+        self.assertIsNone(app.last_output_path)
         app._set_state.assert_called_once_with(AppState.COMPLETED)
 
     def test_refresh_job_list_uses_job_status_directly(self) -> None:

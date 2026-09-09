@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from sdr2hdr.gui_output import PreviewOutputs, export_preview
+
 from sdr2hdr.app import (
     CancelToken,
     ConversionCallbacks,
@@ -135,6 +137,7 @@ class AppState:
     IDLE = "idle"
     RUNNING = "running"
     CANCELLING = "cancelling"
+    EXPORTING = "exporting"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -145,6 +148,7 @@ class QueueJob:
     request: ConversionRequest | LogConversionRequest | ImageConversionRequest | ImageLogConversionRequest
     status: str = "queued"
     error: str = ""
+    preview_path: str | None = None
 
 
 STATUS_LABELS = {
@@ -152,7 +156,8 @@ STATUS_LABELS = {
     "starting": "開始中",
     "running": "実行中",
     "cancelling": "キャンセル中",
-    "completed": "完了",
+    "completed": "未書き出し",
+    "exported": "書き出し済",
     "failed": "失敗",
     "cancelled": "キャンセル済",
 }
@@ -177,8 +182,10 @@ class SDR2HDRGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("SDR2HDR Pro")
-        self.root.geometry("1440x900")
-        self.root.minsize(1280, 900)
+        self.root.geometry("1760x1000")
+        self.root.minsize(1680, 900)
+        self.preview_outputs = PreviewOutputs()
+        self._closing = False
         self.state = AppState.IDLE
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -238,14 +245,31 @@ class SDR2HDRGUI:
         self.img_log_format_var = tk.StringVar(value=self.img_format_options[".tif"])
 
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        if self.system_name == "Darwin":
+            self.root.createcommand("::tk::mac::Quit", self._close)
         self.root.update_idletasks()
-        width = max(1440, self.root.winfo_reqwidth())
-        height = max(900, self.root.winfo_reqheight())
+        width = min(self.root.winfo_screenwidth(), max(1760, self.root.winfo_reqwidth()))
+        height = min(self.root.winfo_screenheight() - 60, max(1000, self.root.winfo_reqheight()))
         x = max(0, (self.root.winfo_screenwidth() - width) // 2)
         y = max(0, (self.root.winfo_screenheight() - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
         self._set_state(AppState.IDLE)
         self.root.after(100, self._drain_events)
+
+    def _close(self):
+        if not self._closing:
+            self._closing = True
+            if self.cancel_token:
+                self.cancel_token.cancel()
+            self.compare_view.close()
+            self.root.withdraw()
+        # Wait asynchronously so no writer can recreate files after cleanup.
+        if self.worker and self.worker.is_alive():
+            self.root.after(50, self._close)
+            return
+        self.preview_outputs.close()
+        self.root.destroy()
 
     def _build(self) -> None:
         from sdr2hdr.gui_style import apply_theme, ButtonSlot
@@ -256,20 +280,21 @@ class SDR2HDRGUI:
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=3, minsize=670)
         outer.columnconfigure(1, weight=2, minsize=500)
+        outer.columnconfigure(2, weight=2, minsize=440)
         outer.rowconfigure(1, weight=1)
 
         hero = tk.Frame(outer, bg="#efb4eb", highlightbackground="#14200e", highlightthickness=3)
-        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 16))
+        hero.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 16))
         tk.Label(hero, text="SDR2HDR", font=("Impact", 46), bg="#efb4eb", fg="#14200e").pack(side="left", padx=22, pady=14)
-        tk.Label(hero, text="いつもの映像を、HDRへ。\n素材を選ぶ → 形式を決める → 変換して保存", justify="left", font=("Helvetica Neue", 12), bg="#efb4eb", fg="#14200e").pack(side="left", padx=20)
+        tk.Label(hero, text="いつもの映像を、HDRへ。\n素材と形式を選ぶ → 変換して確認 → 書き出す", justify="left", font=("Helvetica Neue", 12), bg="#efb4eb", fg="#14200e").pack(side="left", padx=20)
         self.hero_art = tk.PhotoImage(file=str(Path(__file__).parent / "assets" / "film-editor.png")).subsample(8)
         tk.Label(hero, image=self.hero_art, bg="#efb4eb", borderwidth=0).pack(side="right", padx=10, pady=8)
 
-        left = ttk.Frame(outer, padding=16, style="Card.TFrame")
+        left = ttk.Frame(outer, padding=(16, 12), style="Card.TFrame")
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(4, weight=1)
-        ttk.Label(left, text="01  /  CONVERT", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 14))
+        ttk.Label(left, text="01  /  CONVERT", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         self.notebook = ttk.Notebook(left)
         self.notebook.grid(row=1, column=0, sticky="ew")
         self.ai_tab = ttk.Frame(self.notebook, padding=8)
@@ -292,23 +317,28 @@ class SDR2HDRGUI:
                         widget.grid_configure(row=int(info["row"]) + 1)
                 ttk.Label(tab, text=title, style="Group.TLabel").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(3, 2))
         self.feedback_var = tk.StringVar(value="設定した素材を一覧へ追加して、まとめて変換できます。")
-        ttk.Label(left, textvariable=self.feedback_var, style="Muted.TLabel", wraplength=540).grid(row=2, column=0, sticky="ew", pady=(14, 8))
+        ttk.Label(left, textvariable=self.feedback_var, style="Muted.TLabel", wraplength=540).grid(row=2, column=0, sticky="ew", pady=(6, 0))
         add_queue_slot = ButtonSlot(left, self.reduce_motion_var, text="変換待ちに追加", command=self._enqueue_current, style="Accent.TButton")
         self.add_queue_button = add_queue_slot.button
         add_queue_slot.grid(row=3, column=0, sticky="ew")
 
         right = ttk.Frame(outer, padding=16, style="Card.TFrame")
         right.grid(row=1, column=1, sticky="nsew")
+        from sdr2hdr.compare_view import CompareView
+        self.compare_view = CompareView(outer)
+        self.compare_view.grid(row=1, column=2, sticky="nsew", padx=(14, 0))
         right.columnconfigure(0, weight=1)
         right.rowconfigure(2, weight=1)
         ttk.Label(right, text="02  /  EXPORT", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
-        ttk.Label(right, text="変換待ち一覧", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(right, text="変換一覧 / 未書き出しの結果をまとめて保存", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 8))
         queue_frame = ttk.Frame(right)
         queue_frame.grid(row=2, column=0, sticky="nsew")
+        queue_frame.configure(height=180)
+        queue_frame.grid_propagate(False)
         queue_frame.columnconfigure(0, weight=1)
         queue_frame.rowconfigure(0, weight=1)
         self.queue_view = ttk.Treeview(queue_frame, columns=("status", "input", "output"), show="headings", height=4)
-        for key, label, width in (("status", "状態", 75), ("input", "入力ファイル", 130), ("output", "出力ファイル", 140)):
+        for key, label, width in (("status", "状態", 105), ("input", "入力ファイル", 120), ("output", "出力ファイル", 140)):
             self.queue_view.heading(key, text=label)
             self.queue_view.column(key, width=width, minwidth=65, anchor="w")
         self.queue_view.grid(row=0, column=0, sticky="nsew")
@@ -324,8 +354,6 @@ class SDR2HDRGUI:
         detail_scroll.grid(row=2, column=1, sticky="ns")
         self.job_detail.configure(yscrollcommand=detail_scroll.set)
         self.detail_scroll = detail_scroll
-        self.job_detail.grid_remove()
-        self.detail_scroll.grid_remove()
         self.queue_view.bind("<<TreeviewSelect>>", self._show_job_detail)
         queue_controls = ttk.Frame(right)
         queue_controls.grid(row=3, column=0, sticky="ew", pady=10)
@@ -334,43 +362,54 @@ class SDR2HDRGUI:
         self.clear_queue_button = ttk.Button(queue_controls, text="一覧をクリア", command=self._clear_queue)
         self.clear_queue_button.pack(side="right")
 
-        status_frame = ttk.Frame(right, padding=14, style="Green.TFrame")
+        status_frame = ttk.Frame(right, padding=10, style="Green.TFrame")
         status_frame.grid(row=4, column=0, sticky="ew", pady=(6, 12))
-        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel", wraplength=410)
         self.status_label.pack(anchor="w")
-        ttk.Label(status_frame, textvariable=self.progress_var, style="Green.TLabel", wraplength=330).pack(anchor="w", pady=(6, 12))
+        tk.Label(status_frame, textvariable=self.progress_var, bg="#a9d994", fg="#14200e", font=("Helvetica Neue", 11), height=1, anchor="w", justify="left", wraplength=410).pack(fill="x", pady=(4, 4))
         self.result_var = tk.StringVar()
-        ttk.Label(status_frame, textvariable=self.result_var, style="Green.TLabel", wraplength=330).pack(anchor="w", pady=(0, 5))
+        tk.Label(status_frame, textvariable=self.result_var, bg="#a9d994", fg="#14200e", font=("Helvetica Neue", 11), height=2, anchor="w", justify="left", wraplength=410).pack(fill="x", pady=(0, 5))
         self.progress = ttk.Progressbar(status_frame, mode="determinate", maximum=100)
         self.progress.pack(fill="x")
         conversion_controls = ttk.Frame(right)
         conversion_controls.grid(row=5, column=0, sticky="ew", pady=(0, 8))
-        conversion_controls.columnconfigure(0, weight=1)
-        conversion_controls.columnconfigure(1, weight=1)
-        start_slot = ButtonSlot(conversion_controls, self.reduce_motion_var, text="HDRへの変換を開始", command=self._start, style="Primary.TButton")
+        conversion_controls.columnconfigure(0, weight=1, uniform="conversion")
+        conversion_controls.columnconfigure(1, weight=1, uniform="conversion")
+        start_slot = ButtonSlot(conversion_controls, self.reduce_motion_var, text="変換を開始", command=self._start, style="Primary.TButton")
         self.start_button = start_slot.button
-        start_slot.grid(row=0, column=0, sticky="ew")
-        self.stop_button = ttk.Button(conversion_controls, text="現在の処理を停止", command=self._stop)
-        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        start_slot.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        stop_slot = ButtonSlot(conversion_controls, self.reduce_motion_var, text="現在の処理を停止", command=self._stop, style="Primary.TButton")
+        self.stop_button = stop_slot.button
+        stop_slot.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        export_slot = ButtonSlot(right, self.reduce_motion_var, text="変換済みを書き出す", command=self._export, style="Accent.TButton")
+        self.export_button = export_slot.button
+        export_slot.grid(row=6, column=0, sticky="ew", pady=(0, 4))
         output_controls = ttk.Frame(right)
         output_controls.grid(row=7, column=0, sticky="ew")
-        open_output_slot = ButtonSlot(output_controls, self.reduce_motion_var, text="出力を開く", command=self._open_output)
-        self.open_output_button = open_output_slot.button
-        open_output_slot.pack(side="left", fill="x", expand=True)
+        self.open_output_button = ttk.Button(output_controls, text="出力を開く", command=self._open_output)
+        self.open_output_button.pack(side="left", fill="x", expand=True)
         self.open_folder_button = ttk.Button(output_controls, text="保存フォルダ", command=self._open_folder)
         self.open_folder_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        ttk.Label(right, text="処理ログ", style="Muted.TLabel").grid(row=8, column=0, sticky="w", pady=(18, 6))
-        log_frame = ttk.Frame(right)
-        log_frame.grid(row=9, column=0, sticky="ew")
-        self.log = tk.Text(log_frame, height=3, width=25, wrap="word", state="disabled", bg="#f5f3ec", fg="#14200e", relief="flat", padx=10, pady=8, font=("Menlo", 10), highlightthickness=1, highlightbackground="#14200e")
+        self.log_window = tk.Toplevel(self.root)
+        self.log_window.title("処理ログ")
+        self.log_window.geometry("760x340")
+        self.log_window.withdraw()
+        self.log_window.protocol("WM_DELETE_WINDOW", self.log_window.withdraw)
+        log_frame = ttk.Frame(self.log_window, padding=12)
+        log_frame.pack(fill="both", expand=True)
+        self.log = tk.Text(log_frame, height=12, width=65, wrap="word", state="disabled", bg="#f5f3ec", fg="#14200e", relief="flat", padx=10, pady=8, font=("Menlo", 10), highlightthickness=1, highlightbackground="#14200e")
         self.log.pack(side="left", fill="both", expand=True)
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         log_scroll.pack(side="right", fill="y")
         self.log.configure(yscrollcommand=log_scroll.set)
 
         from sdr2hdr.gui_style import FeedbackMotion
-        self.feedback_motion = FeedbackMotion(self.root, self.reduce_motion_var, self.status_label, self.open_output_button)
-        ttk.Checkbutton(right, text="動きを減らす", variable=self.reduce_motion_var).grid(row=10, column=0, sticky="w", pady=(8, 0))
+        self.feedback_motion = FeedbackMotion(self.root, self.reduce_motion_var, self.status_label, self.export_button)
+        footer = ttk.Frame(right)
+        footer.grid(row=8, column=0, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(footer, text="動きを減らす", variable=self.reduce_motion_var).pack(side="left")
+        self.log_button = ttk.Button(footer, text="処理ログを開く", command=self._show_log)
+        self.log_button.pack(side="right")
 
         self.input_var.trace_add("write", self._sync_output_path)
         self.log_input_var.trace_add("write", self._sync_log_output_path)
@@ -577,7 +616,7 @@ class SDR2HDRGUI:
             widget.grid() if exr else widget.grid_remove()
         for widget in quality_widgets:
             widget.grid_remove() if exr else widget.grid()
-        running = self.state in {AppState.RUNNING, AppState.CANCELLING}
+        running = self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}
         combo.configure(state="disabled" if running else "readonly")
 
     def _sync_path(self, key, input_var, output_var, extension):
@@ -688,7 +727,7 @@ class SDR2HDRGUI:
 
     def _sync_model_controls(self, *_: object) -> None:
         has_model = bool(self.model_path_var.get().strip())
-        running = self.state in {AppState.RUNNING, AppState.CANCELLING}
+        running = self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}
         scale_state = "normal" if has_model and not running else "disabled"
         self.ai_strength_scale.configure(state=scale_state)
         self._sync_ai_strength_label()
@@ -729,7 +768,7 @@ class SDR2HDRGUI:
         return "auto"
 
     def _browse_inputs(self, key, input_var, output_var, image=False):
-        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+        if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}:
             return
         pattern = "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.heic *.avif" if image else "*.mp4 *.mov *.mkv *.m2ts *.mts"
         paths = filedialog.askopenfilenames(title="入力ファイルを選択（複数選択可）", filetypes=[("画像" if image else "動画", pattern), ("すべてのファイル", "*.*")])
@@ -751,7 +790,7 @@ class SDR2HDRGUI:
         self._browse_inputs("video_ai", self.input_var, self.output_var)
 
     def _browse_selected_output(self, variable, extension, key):
-        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+        if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}:
             return
         current = Path(variable.get()) if variable.get().strip() else None
         if key in self._input_batches:
@@ -906,9 +945,9 @@ class SDR2HDRGUI:
                 self.job_detail.configure(state="normal")
                 self.job_detail.delete("1.0", "end")
                 self.job_detail.configure(state="disabled")
-                self.job_detail.grid_remove()
-                self.detail_scroll.grid_remove()
-            self.start_button.configure(state="disabled" if self.state in {AppState.RUNNING, AppState.CANCELLING} or (self.queue_jobs and self._next_pending_job_index() is None) else "normal")
+
+            self.start_button.configure(state="disabled" if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING} or (self.queue_jobs and self._next_pending_job_index() is None) else "normal")
+            self._update_export_button()
 
     def _set_job_status(self, index: int | None, status: str) -> None:
         if index is None:
@@ -920,7 +959,6 @@ class SDR2HDRGUI:
     def _enqueue_request(self, request: ConversionRequest | LogConversionRequest) -> None:
         self._validate_request(request)
         self.queue_jobs.append(QueueJob(request=request))
-        self.last_output_path = request.output_path
         self._refresh_job_list()
         if hasattr(self, "feedback_motion"):
             self.start_button.configure(state="normal")
@@ -976,7 +1014,7 @@ class SDR2HDRGUI:
         return sorted((int(item_id) for item_id in self.queue_view.selection()), reverse=True)
 
     def _remove_selected_job(self) -> None:
-        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+        if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}:
             return
         removed = False
         for index in self._selected_job_indices():
@@ -988,7 +1026,7 @@ class SDR2HDRGUI:
             self._log("選択されたキュー項目を削除しました")
 
     def _clear_queue(self) -> None:
-        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+        if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}:
             return
         self.queue_jobs.clear()
         self.current_job_index = None
@@ -1003,10 +1041,10 @@ class SDR2HDRGUI:
 
     def _start_job(self, index: int) -> None:
         request = self.queue_jobs[index].request
+        request = replace(request, output_path=self.preview_outputs.allocate(request.output_path))
         self.current_job_index = index
         self._set_job_status(index, "starting")
         self.cancel_token = CancelToken()
-        self.last_output_path = request.output_path
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(10)
         self.status_var.set("開始中")
@@ -1042,7 +1080,7 @@ class SDR2HDRGUI:
         self.worker.start()
 
     def _start(self) -> None:
-        if self.state in {AppState.RUNNING, AppState.CANCELLING}:
+        if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}:
             return
         if not self.queue_jobs:
             try:
@@ -1064,6 +1102,10 @@ class SDR2HDRGUI:
             self._set_state(AppState.CANCELLING)
             self._log("停止が要求されました")
 
+    def _show_log(self):
+        self.log_window.deiconify()
+        self.log_window.lift()
+
     def _open_output(self) -> None:
         if not self.last_output_path:
             return
@@ -1075,11 +1117,55 @@ class SDR2HDRGUI:
             return
         open_path(str(Path(self.last_output_path).parent))
 
+    def _update_export_button(self):
+        if not hasattr(self, "export_button"):
+            return
+        pending = sum(job.status == "completed" and bool(job.preview_path) for job in self.queue_jobs)
+        busy = self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}
+        self.export_button.configure(
+            text=f"変換済みを書き出す（{pending}件）" if pending else "変換済みを書き出す",
+            state="normal" if pending and not busy else "disabled",
+        )
+
+    def _export(self):
+        if self.state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}:
+            return
+        jobs = [job for job in self.queue_jobs if job.status == "completed" and job.preview_path]
+        if not jobs:
+            return
+        existing = [job.request.output_path for job in jobs if Path(job.request.output_path).exists()]
+        if existing and not messagebox.askyesno(
+            "既存ファイルを上書き", "次の保存先を上書きしますか？\n" + "\n".join(existing)
+        ):
+            return
+        token = self.cancel_token = CancelToken()
+        self._set_state(AppState.EXPORTING)
+        self.status_var.set("書き出し中")
+        self.result_var.set("変換済みのデータを指定先へ保存しています。")
+        self.progress.configure(mode="determinate", maximum=100, value=0)
+
+        def worker():
+            error = None
+            try:
+                for number, job in enumerate(jobs, 1):
+                    def progress(copied, size):
+                        self.event_queue.put(("export_progress", (number, len(jobs), copied, size)))
+                    if not export_preview(job.preview_path, job.request.output_path, token, progress):
+                        break
+                    self.event_queue.put(("exported", job))
+            except Exception as exc:
+                error = str(exc)
+            self.event_queue.put(("export_finished", (token.cancel_requested, error)))
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+
     def _show_job_detail(self, *_):
         selected = self.queue_view.selection()
         if not selected:
-            self.job_detail.grid_remove()
-            self.detail_scroll.grid_remove()
+            self.job_detail.configure(state="normal")
+            self.job_detail.delete("1.0", "end")
+            self.job_detail.configure(state="disabled")
             return
         self.job_detail.grid()
         self.detail_scroll.grid()
@@ -1124,12 +1210,12 @@ class SDR2HDRGUI:
         if previous != state:
             cues = {
                 AppState.RUNNING: ("start", "変換を開始しました。右側で進捗を確認できます。"),
-                AppState.COMPLETED: ("complete", "保存が完了しました。「出力を開く」で確認できます。"),
+                AppState.COMPLETED: ("complete", "変換完了。指定先への保存は「書き出す」を押してください。"),
                 AppState.CANCELLED: ("stopped", "処理を停止しました。"),
             }
             if state in cues:
                 self._feedback(*cues[state])
-        running = state in {AppState.RUNNING, AppState.CANCELLING}
+        running = state in {AppState.RUNNING, AppState.EXPORTING, AppState.CANCELLING}
         idle_like = state in {AppState.IDLE, AppState.COMPLETED, AppState.FAILED, AppState.CANCELLED}
         field_state = "disabled" if running else "normal"
         combo_state = "disabled" if running else "readonly"
@@ -1148,6 +1234,7 @@ class SDR2HDRGUI:
         self.clear_queue_button.configure(state="disabled" if running else "normal")
         self.open_output_button.configure(state="normal" if idle_like and self.last_output_path else "disabled")
         self.open_folder_button.configure(state="normal" if idle_like and self.last_output_path else "disabled")
+        self._update_export_button()
         self.preset_combo.configure(state=combo_state)
         self.encoder_combo.configure(state=combo_state)
         self.log_encoder_combo.configure(state=combo_state)
@@ -1162,6 +1249,8 @@ class SDR2HDRGUI:
         self.current_job_index = None
 
     def _drain_events(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         while True:
             try:
                 kind, payload = self.event_queue.get_nowait()
@@ -1190,7 +1279,6 @@ class SDR2HDRGUI:
                 self.progress.configure(value=100 if not result.cancelled else 0)
                 if self.current_job_index is not None:
                     self._set_job_status(self.current_job_index, "cancelled" if result.cancelled else "completed")
-                    self.last_output_path = self.queue_jobs[self.current_job_index].request.output_path
                 if result.cancelled:
                     self.status_var.set("キャンセル済")
                     self.progress_var.set(f"{result.processed_frames} フレームで停止しました。今回の未完成出力は破棄しました")
@@ -1199,12 +1287,19 @@ class SDR2HDRGUI:
                     self._set_state(AppState.CANCELLED)
                 else:
                     self.status_var.set("完了")
+                    if self.current_job_index is not None:
+                        job = self.queue_jobs[self.current_job_index]
+                        job.preview_path = result.output_path
+                        request = job.request
+                        self.compare_view.add_pair(
+                            request.input_path, result.output_path,
+                            image=isinstance(request, (ImageConversionRequest, ImageLogConversionRequest)),
+                        )
                     if Path(result.output_path).suffix.lower() == ".zip":
-                        self.progress_var.set(f"EXR画像 {result.processed_frames} 枚をZIPに保存しました")
-                        self._log(f"EXR ZIPの保存先: {result.output_path}")
+                        self.progress_var.set(f"EXR画像 {result.processed_frames} 枚のZIPを準備しました")
                     else:
-                        self.progress_var.set(f"{result.processed_frames} フレーム書き出しました")
-                    self._log(f"完了: {result.output_path}")
+                        self.progress_var.set(f"{result.processed_frames} フレーム変換しました")
+                    self._log(f"変換完了（未書き出し）: {Path(result.output_path).name}")
                     self._finish_current_job()
                     next_index = self._next_pending_job_index()
                     if next_index is not None:
@@ -1214,6 +1309,25 @@ class SDR2HDRGUI:
                         self._set_state(AppState.COMPLETED)
             elif kind == "error":
                 self._log(str(payload))
+            elif kind == "export_progress":
+                number, total, copied, size = payload
+                self.progress.configure(value=100 * ((number - 1) + copied / size) / total)
+                self.progress_var.set(f"{number}/{total} 件を書き出しています")
+            elif kind == "exported":
+                payload.status = "exported"
+                self.last_output_path = payload.request.output_path
+                self._refresh_job_list()
+                self._log(f"書き出し完了: {self.last_output_path}")
+            elif kind == "export_finished":
+                cancelled, error = payload
+                self._finish_current_job()
+                self._set_state(AppState.IDLE)
+                self.status_var.set("書き出し失敗" if error else "書き出し停止" if cancelled else "書き出し完了")
+                self.result_var.set(error or ("未書き出しの結果は再度保存できます。" if cancelled else "指定先へ保存しました。「出力を開く」で確認できます。"))
+                self.progress_var.set("" if error or cancelled else "書き出しが完了しました")
+                if error:
+                    self._log(error)
+                    messagebox.showerror("書き出しに失敗しました", error)
             elif kind == "failed":
                 self.progress.stop()
                 self.progress.configure(value=0)
