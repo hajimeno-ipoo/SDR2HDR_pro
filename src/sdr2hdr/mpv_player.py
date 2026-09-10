@@ -24,6 +24,9 @@ class MpvPlayer:
             input_default_bindings=False, input_vo_keyboard=False,
             idle=True, keep_open="always", pause=True, mute=hdr,
             image_display_duration="inf", hwdec="auto-safe",
+            # The GPU and GPU-next defaults differ. Use the BT.2390 EETF in both;
+            # 0.5 is its standard knee offset (GPU-next otherwise defaults to 1).
+            tone_mapping="bt.2390", tone_mapping_param=0.5,
         )
         options.update(surface.player_options(hdr))
         try:
@@ -53,6 +56,11 @@ class MpvPlayer:
             self.events.get()
         self.loaded = False
         self.mpv.pause = True
+        peak = info.get("source_peak_nits")
+        # format's sig-peak changes only metadata (convert=no is its default).
+        # Clear it on every other load so a still's peak cannot leak into video.
+        self.mpv["vf"] = (f"format=sig-peak={max(1.0, peak / 203.0):.9g}"
+                          if self.hdr and peak is not None else "")
         self.surface.configure_color(self.mpv, info, self.hdr)
         data = info.get("image_bytes")
         if data is not None:

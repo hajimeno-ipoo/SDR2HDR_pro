@@ -125,3 +125,41 @@ def test_corrupt_jxl_does_not_silently_fall_back_to_sdr(tmp_path):
     path=tmp_path/'bad.jxl';path.write_bytes(b'not an image')
     with pytest.raises(RuntimeError):
         prepare_image(str(path),{},app_hdr_output=True)
+
+
+@pytest.mark.parametrize('suffix', ['.png', '.tif', '.jxl'])
+def test_still_peak_describes_decoded_pixels_without_changing_file(tmp_path, suffix):
+    from sdr2hdr.hdr_guidance import linear_nits_to_pq
+    nits=np.array([0., 100., 203., 1000.])
+    codes=np.rint(linear_nits_to_pq(nits)*65535).astype(np.uint16)
+    pixels=np.broadcast_to(codes[None,:,None],(32,4,3)).copy()
+    path=tmp_path/('peak'+suffix)
+    assert save_image_hdr(str(path),pixels)
+    original=path.read_bytes()
+    metadata=ffprobe_comparison(str(path))
+    info=prepare_image(str(path),metadata,app_hdr_output=True)
+    # One RGB16 code around 1000 nits is approximately 0.14 nits.
+    assert abs(info['source_peak_nits']-1000)<.15
+    assert 'source_peak_nits' not in metadata
+    assert path.read_bytes()==original
+
+
+def test_png_peak_reads_unicode_path_without_opencv_file_io(tmp_path, monkeypatch):
+    from sdr2hdr.hdr_guidance import linear_nits_to_pq
+
+    folder = tmp_path / '日本語のフォルダ'
+    folder.mkdir()
+    path = folder / 'てすと.png'
+    code = np.rint(linear_nits_to_pq(np.array(1000.0)) * 65535)
+    pixels = np.full((16, 32, 3), code, dtype=np.uint16)
+    assert save_image_hdr(str(path), pixels)
+    original = path.read_bytes()
+    metadata = ffprobe_comparison(str(path))
+    # Model OpenCV's filename failure on Windows with a non-UTF-8 code page.
+    # The real PNG decoder and Python's Unicode file handling remain in use.
+    monkeypatch.setattr(cv2, 'imread', lambda *args, **kwargs: None)
+    info = prepare_image(str(path), metadata, app_hdr_output=True)
+    assert abs(info['source_peak_nits'] - 1000) < .15
+    assert 'image_bytes' not in info  # Keep the original file as mpv's input.
+    assert path.read_bytes() == original
+    np.testing.assert_array_equal(rgb16_from_png(original), pixels)

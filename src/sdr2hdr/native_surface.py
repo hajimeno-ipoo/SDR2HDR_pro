@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import platform
 import queue
+import math
 
 if platform.system() == "Darwin":
     import AppKit
@@ -51,17 +52,18 @@ class WindowsSurface:
 
     def player_options(self, hdr):
         return dict(wid=str(self.widget.winfo_id()), vo="gpu-next", gpu_api="d3d11",
-                    target_colorspace_hint="yes" if hdr else "no",
-                    target_colorspace_hint_mode="source")
+                    target_colorspace_hint="auto",
+                    target_colorspace_hint_mode="target")
 
     def attach(self, player):
         self.player = player
 
     def configure_color(self, player, info, hdr):
-        # These are output targets, not overrides of the input file's tags.
-        player["target-prim"] = "bt.2020" if hdr else "bt.709"
-        player["target-trc"] = "pq" if hdr else "srgb"
-        player["target-peak"] = 10000 if hdr else 203
+        # D3D11 supplies display HDR/SDR state, gamut and peak to GPU-next.
+        # Forcing source PQ / 10,000 nits overrides that display information.
+        player["target-prim"] = "auto" if hdr else "bt.709"
+        player["target-trc"] = "auto" if hdr else "srgb"
+        player["target-peak"] = "auto" if hdr else 203
 
     def draw(self):
         pass  # D3D11 owns the child HWND and its rendering loop.
@@ -87,6 +89,7 @@ class MacSurface:
         self._bounds = None
         self._color = None
         self._configured_hdr = False
+        self._target_peak = None
         widget.update_idletasks()
         # Tk's Window id is a MacDrawable, not an Objective-C object.
         # Use the exported Tk macOS accessor instead of casting that id.
@@ -165,23 +168,41 @@ class MacSurface:
     def configure_color(self, player, info, hdr):
         import Quartz
 
-        transfer = info.get("color_transfer")
         if hdr:
-            trc = "hlg" if transfer == "arib-std-b67" else "pq"
-            color = Quartz.kCGColorSpaceITUR_2100_HLG if trc == "hlg" else Quartz.kCGColorSpaceITUR_2100_PQ
-            primaries, peak = "bt.2020", 1000 if trc == "hlg" else 10000
+            # Always hand Core Animation absolute PQ. HLG's output OOTF depends
+            # on target peak, whereas its named layer color space assumes 1000 nits.
+            trc, primaries, color = "pq", "bt.2020", Quartz.kCGColorSpaceITUR_2100_PQ
         else:
-            trc, primaries, peak, color = "srgb", "bt.709", 203, Quartz.kCGColorSpaceSRGB
+            trc, primaries, color = "srgb", "bt.709", Quartz.kCGColorSpaceSRGB
         player["target-trc"] = trc
         player["target-prim"] = primaries
-        player["target-peak"] = peak
         self._color = Quartz.CGColorSpaceCreateWithName(color)
         if self._color is None:
             raise RuntimeError("表示面の色空間を作成できません")
         self.layer.setColorspace_(self._color)
         self.layer.setWantsExtendedDynamicRangeContent_(hdr)
+        if self.layer.respondsToSelector_("setToneMapMode:"):
+            # libmpv now maps to the display limit; do not map it a second time.
+            self.layer.setToneMapMode_(Quartz.CAToneMapModeNever)
         self._configured_hdr = hdr
+        self._target_peak = None
+        self._update_display_peak()
         self.pending.set()
+
+    def _update_display_peak(self):
+        # libmpv's OpenGL render API cannot discover this NSView's display.
+        # EDR is relative to SDR white; mpv's PQ output uses 203 nits for 1.0.
+        screen = self.view.window().screen() if self.view and self.view.window() else None
+        headroom = float(screen.maximumExtendedDynamicRangeColorComponentValue()) if screen else 1.0
+        if not math.isfinite(headroom) or headroom < 1:
+            headroom = 1.0
+        # mpv 0.41's target-peak option accepts integer nits, not a float string.
+        peak = min(10000, int(203.0 * headroom)) if self._configured_hdr else 203
+        if peak == self._target_peak:
+            return False
+        self.player["target-peak"] = peak
+        self._target_peak = peak
+        return True
 
     def _resize(self):
         import AppKit
@@ -221,7 +242,8 @@ class MacSurface:
             self.view.draggable = cursor == "fleur"
             self.view.window().invalidateCursorRectsForView_(self.view)
         changed = self._resize()
-        if changed or self.pending.is_set():
+        peak_changed = self._update_display_peak()
+        if changed or peak_changed or self.pending.is_set():
             self.pending.clear()
             self.bridge.comparison_layer_make_current(self.layer_pointer)
             self.renderer.update()

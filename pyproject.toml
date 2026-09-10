@@ -40,4 +40,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-sdr2hdr = ["assets/*.png"]
+sdr2hdr = ["assets/*.png", "assets/*.icc", "assets/*.md"]

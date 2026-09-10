@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 
 import numpy as np
+import cv2
 
 from .io import require_ultrahdr_tool
 
@@ -47,12 +48,15 @@ def prepare_image(path: str, info: dict, *, app_hdr_output: bool = False) -> dic
             "-c:v", "png", "-pix_fmt", "rgb48be", "-f", "image2pipe", "-",
         ])
     elif app_hdr_output and extension in {".tif", ".tiff"}:
-        # save_image_hdr stores full-range BT.2020/PQ RGB16 in TIFF, whose
-        # FFmpeg encoder cannot signal this. This is producer knowledge, not
-        # a guess applied to arbitrary TIFF inputs or other HDR formats.
+        # TIFF output carries a PQ ICC profile, but FFmpeg does not expose it
+        # as transfer/primaries for mpv. Keep the producer's RGB16 definition
+        # for our outputs (including older untagged TIFFs), not arbitrary TIFFs.
         info["image_bytes"] = _run([
             "ffmpeg", "-v", "error", "-i", path, "-frames:v", "1",
-            "-vf", "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
+            # The PNG encoder otherwise prioritizes ICC and omits CICP.
+            # Replace only the in-memory profile with equivalent PQ signalling.
+            "-vf", "sidedata=mode=delete:type=ICC_PROFILE,"
+            "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
             "-c:v", "png", "-pix_fmt", "rgb48be", "-f", "image2pipe", "-",
         ])
         info.update(color_primaries="bt2020", color_transfer="smpte2084",
@@ -79,4 +83,18 @@ def prepare_image(path: str, info: dict, *, app_hdr_output: bool = False) -> dic
         ], data=rgb16.tobytes())
         info.update(color_primaries="bt2020", color_transfer="smpte2084",
                     color_source="HDR復元", bit_depth=10)
+    if app_hdr_output and info.get("color_transfer") == "smpte2084":
+        # Provide the actual decoded still's peak to both platform players.
+        # Without light-level metadata mpv otherwise assumes PQ's 10,000 nits.
+        data = info.get("image_bytes")
+        if data is None:
+            data = Path(path).read_bytes()
+        pixels = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+        if pixels is None or pixels.dtype != np.uint16 or pixels.ndim != 3:
+            raise RuntimeError("HDR比較画像の16bit画素を読み取れません")
+        power = (float(pixels[..., :3].max()) / 65535.0) ** (32.0 / 2523.0)
+        info["source_peak_nits"] = 10000.0 * (
+            max(power - 3424.0 / 4096.0, 0.0)
+            / (2413.0 / 128.0 - 2392.0 / 128.0 * power)
+        ) ** (16384.0 / 2610.0)
     return info

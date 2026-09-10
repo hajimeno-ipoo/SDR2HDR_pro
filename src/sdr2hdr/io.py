@@ -718,13 +718,21 @@ def _save_jpeg_hdr(output_path, image_rgb48, cancel_check) -> bool:
     # libultrahdr v1.4: full-range PQ, BT.2100, little-endian RGBA1010102.
     rgb = np.rint(image_rgb48.astype(np.float64) * (1023.0 / 65535.0)).astype(np.uint32)
     packed = rgb[..., 0] | (rgb[..., 1] << 10) | (rgb[..., 2] << 20) | np.uint32(3 << 30)
+    # ST 2084: describe the actual packed input peak, not PQ's 10,000 nit ceiling.
+    # libultrahdr -L sets hdr_capacity_max only; gain-map samples remain unchanged.
+    power = (float(rgb.max()) / 1023.0) ** (32.0 / 2523.0)
+    peak_nits = 10000.0 * (max(power - 3424.0 / 4096.0, 0.0)
+                          / (2413.0 / 128.0 - 2392.0 / 128.0 * power)) ** (16384.0 / 2610.0)
+    # The decoder requires capacity_max > capacity_min, even for all-SDR pixels.
+    minimum_peak = float(np.nextafter(np.float32(203.0), np.float32(np.inf)))
     with tempfile.TemporaryDirectory(prefix=".ultrahdr-", dir=Path(output_path).parent) as directory:
         raw = Path(directory) / "hdr.raw"
         encoded = Path(directory) / "hdr.jpg"
         packed.astype("<u4").tofile(raw)
         cmd = [executable, "-m", "0", "-p", str(raw), "-w", str(w), "-h", str(h),
                "-a", "5", "-C", "2", "-t", "2", "-R", "1", "-q", "95", "-Q", "95",
-               "-s", "1", "-M", "1", "-z", str(encoded)]
+               "-s", "1", "-M", "1", "-L", str(max(minimum_peak, min(10000.0, peak_nits))),
+               "-z", str(encoded)]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             while True:
@@ -745,8 +753,86 @@ def _save_jpeg_hdr(output_path, image_rgb48, cancel_check) -> bool:
             raise RuntimeError("HDR JPEGの保存に失敗しました: " + log.decode("utf-8", errors="replace"))
         if cancel_check and cancel_check():
             return False
+        _tag_jpeg_hdr_gainmap(encoded)
+        if cancel_check and cancel_check():
+            return False
         encoded.replace(output_path)
     return True
+
+
+def _bt2100_pq_icc() -> bytes:
+    if platform.system() == "Darwin":
+        import Quartz
+
+        color = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceITUR_2100_PQ)
+        return bytes(Quartz.CGColorSpaceCopyICCData(color))
+    return (Path(__file__).parent / "assets" / "bt2100-pq.icc").read_bytes()
+
+
+def _jpeg_header_segments(data: bytes | bytearray, start: int, end: int):
+    """Read marker segments before the first scan in an encoder-produced JPEG."""
+    if data[start:start + 2] != b"\xff\xd8":
+        raise RuntimeError("HDR JPEG encoder returned an invalid image header.")
+    pos = start + 2
+    while pos + 4 <= end:
+        marker = data[pos:pos + 2]
+        if marker == b"\xff\xda":
+            return
+        size = int.from_bytes(data[pos + 2:pos + 4], "big") + 2
+        if marker[0] != 255 or size < 4 or pos + size > end:
+            break
+        yield pos, size, marker
+        pos += size
+    raise RuntimeError("HDR JPEG encoder returned an incomplete image header.")
+
+
+def _tag_jpeg_hdr_gainmap(path: Path) -> None:
+    """Replace the alternate BT.2020/PQ ICC, retaining both JPEG scans and ISO metadata.
+
+    libultrahdr 1.4's ISO-only writer uses a Lab PCS PQ profile that ColorSync
+    rejects. MPF's second image size must follow the replacement ICC's length.
+    This is for our encoder output, not a general JPEG metadata editor.
+    """
+    data = bytearray(path.read_bytes())
+    mpf = [(p + 8, p + size) for p, size, marker in _jpeg_header_segments(data, 0, len(data))
+           if marker == b"\xff\xe2" and data[p + 4:p + 8] == b"MPF\0"]
+    if len(mpf) != 1:
+        raise RuntimeError("HDR JPEG encoder returned no unique MPF index.")
+    base, end = mpf[0]
+    if data[base:base + 4] not in (b"II\x2a\0", b"MM\0\x2a"):
+        raise RuntimeError("HDR JPEG encoder returned an invalid MPF index.")
+    endian = "<" if data[base:base + 2] == b"II" else ">"
+    ifd = base + struct.unpack_from(endian + "I", data, base + 4)[0]
+    if not base + 8 <= ifd <= end - 2:
+        raise RuntimeError("HDR JPEG encoder returned an invalid MPF directory.")
+    count = struct.unpack_from(endian + "H", data, ifd)[0]
+    if ifd + 2 + count * 12 + 4 > end:
+        raise RuntimeError("HDR JPEG encoder returned a truncated MPF directory.")
+    entries = None
+    for i in range(count):
+        tag, kind, size, offset = struct.unpack_from(endian + "HHII", data, ifd + 2 + i * 12)
+        if tag == 0xB002 and kind == 7 and size == 32:
+            entries = base + offset
+    if entries is None or not ifd + 2 + count * 12 + 4 <= entries <= end - 32:
+        raise RuntimeError("HDR JPEG encoder returned unsupported MPF image entries.")
+    size, offset = struct.unpack_from(endian + "II", data, entries + 20)
+    start = base + offset
+    if start < end or start + size != len(data) or data[-2:] != b"\xff\xd9":
+        raise RuntimeError("HDR JPEG encoder returned an invalid gain-map extent.")
+    profiles = [(p, n) for p, n, marker in _jpeg_header_segments(data, start, start + size)
+                if marker == b"\xff\xe2" and data[p + 4:p + 16] == b"ICC_PROFILE\0"]
+    if not profiles:
+        # Writers using the base gamut (including XMP builds) need no alternate ICC.
+        return
+    if len(profiles) != 1 or data[profiles[0][0] + 16:profiles[0][0] + 18] != b"\x01\x01":
+        raise RuntimeError("HDR JPEG encoder returned an unsupported alternate ICC layout.")
+    pos, old_size = profiles[0]
+    profile = _bt2100_pq_icc()
+    payload = b"ICC_PROFILE\0\x01\x01" + profile
+    replacement = b"\xff\xe2" + struct.pack(">H", len(payload) + 2) + payload
+    data[pos:pos + old_size] = replacement
+    struct.pack_into(endian + "I", data, entries + 20, size + len(replacement) - old_size)
+    path.write_bytes(data)
 
 
 def _tag_hdr_png(output_path: str) -> None:
@@ -768,6 +854,39 @@ def _tag_hdr_png(output_path: str) -> None:
             parts.append(struct.pack(">I", 4) + payload + struct.pack(">I", zlib.crc32(payload)))
         offset += 12 + length
     path.write_bytes(b"".join(parts))
+
+
+def _tag_hdr_tiff(output_path: str) -> None:
+    """Embed full-range BT.2100 PQ ICC without rewriting any pixel strips.
+
+    ICC Profile Embedding technical note: TIFF tag 34675, type UNDEFINED.
+    This handles the single-image classic TIFF produced by our FFmpeg encoder.
+    """
+    profile = _bt2100_pq_icc()
+    with Path(output_path).open("r+b") as stream:
+        header = stream.read(8)
+        if header[:4] not in {b"II\x2a\x00", b"MM\x00\x2a"}:
+            raise RuntimeError("TIFF encoder returned an unsupported header.")
+        endian = "<" if header[:2] == b"II" else ">"
+        stream.seek(struct.unpack_from(endian + "I", header, 4)[0])
+        count = struct.unpack(endian + "H", stream.read(2))[0]
+        entries = [stream.read(12) for _ in range(count)]
+        next_ifd = stream.read(4)
+        if any(len(entry) != 12 for entry in entries) or next_ifd != bytes(4):
+            raise RuntimeError("TIFF encoder returned an incomplete or multi-image file.")
+        entries = [entry for entry in entries if struct.unpack_from(endian + "H", entry)[0] != 34675]
+        stream.seek(0, 2)
+        stream.write(bytes(stream.tell() % 2))
+        profile_offset = stream.tell()
+        stream.write(profile)
+        stream.write(bytes(stream.tell() % 2))
+        ifd_offset = stream.tell()
+        entries.append(struct.pack(endian + "HHII", 34675, 7, len(profile), profile_offset))
+        entries.sort(key=lambda entry: struct.unpack_from(endian + "H", entry)[0])
+        stream.write(struct.pack(endian + "H", len(entries)) + b"".join(entries) + next_ifd)
+        # Original strip offsets stay valid. Publish the new directory last.
+        stream.seek(4)
+        stream.write(struct.pack(endian + "I", ifd_offset))
 
 
 def save_image_hdr(
@@ -833,8 +952,8 @@ def save_image_hdr(
         cmd += [
             "-c:v", "tiff",
             "-pix_fmt", "rgb48le",
-            # TIFF HDR metadata support in FFmpeg is limited, 
-            # but we set the colorspace tags.
+            # FFmpeg does not serialize these as a TIFF colour profile.
+            # _tag_hdr_tiff embeds the matching ICC after encoding.
             "-color_primaries", "bt2020",
             "-color_trc", "smpte2084",
             "-colorspace", "bt2020nc",
@@ -871,4 +990,6 @@ def save_image_hdr(
         raise RuntimeError(f"FFmpeg image encoding failed with code {process.returncode}: {stderr}")
     if ext == ".png":
         _tag_hdr_png(output_path)
+    elif ext in {".tif", ".tiff"}:
+        _tag_hdr_tiff(output_path)
     return True

@@ -122,7 +122,7 @@ class CompareView(ttk.Frame):
         pair = ComparePair(sdr_path, hdr_path, image)
         if pair not in self.pairs:
             self.pairs.append(pair)
-        self.selection.configure(values=[f"{i + 1}: {Path(p.sdr_path).name}" for i, p in enumerate(self.pairs)])
+        self.selection.configure(values=[f"{i + 1}: {Path(p.hdr_path).name}" for i, p in enumerate(self.pairs)])
         # A newly completed queue job must not replace an active comparison.
         if self.selection.current() < 0:
             self.selection.current(0)

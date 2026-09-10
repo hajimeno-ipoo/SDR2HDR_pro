@@ -1,6 +1,7 @@
 """Actual HDR image export, signalling, reconstruction and publication checks."""
 import struct
 import subprocess
+import sys
 import zlib
 from pathlib import Path
 from unittest.mock import patch
@@ -42,9 +43,54 @@ def test_png_preserves_full_rgb16_and_hdr_signalling(tmp_path):
     np.testing.assert_array_equal(cv2.imread(str(path), cv2.IMREAD_UNCHANGED)[..., ::-1], pixels)
 
 
-def test_jpeg_reconstructs_hdr_with_official_decoder(tmp_path):
-    # Constant neutral 1000 nit patch isolates HDR reconstruction from JPEG edge loss.
-    pixels = np.full((64,64,3), np.rint(linear_nits_to_pq(np.array(1000.0))*65535), dtype=np.uint16)
+@pytest.mark.parametrize('suffix', ['.tif', '.tiff'])
+def test_tiff_preserves_rgb16_and_embeds_pq_profile(tmp_path, suffix):
+    pixels = np.random.default_rng(93).integers(0, 65536, (33, 65, 3), dtype=np.uint16)
+    path = tmp_path / ('hdr' + suffix)
+    assert io.save_image_hdr(str(path), pixels)
+    np.testing.assert_array_equal(cv2.imread(str(path), cv2.IMREAD_UNCHANGED)[..., ::-1], pixels)
+    data = path.read_bytes()
+    endian = '<' if data[:2] == b'II' else '>'
+    offset = struct.unpack_from(endian+'I', data, 4)[0]
+    count = struct.unpack_from(endian+'H', data, offset)[0]
+    entries = [struct.unpack_from(endian+'HHII', data, offset+2+i*12) for i in range(count)]
+    profiles = [entry for entry in entries if entry[0] == 34675]
+    assert len(profiles) == 1
+    _, kind, size, start = profiles[0]
+    assert kind == 7
+    profile = data[start:start+size]
+    assert len(profile) == size == struct.unpack_from('>I', profile)[0]
+    tags = {profile[132+i*12:136+i*12]: struct.unpack_from('>II', profile, 136+i*12)
+            for i in range(struct.unpack_from('>I', profile, 128)[0])}
+    start, size = tags[b'cicp']
+    assert profile[start:start+size] == b'cicp'+bytes(4)+bytes([9,16,0,1])
+    if sys.platform == 'darwin':
+        import Foundation
+        import Quartz
+
+        source = Quartz.CGImageSourceCreateWithURL(Foundation.NSURL.fileURLWithPath_(str(path)), None)
+        image = Quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
+        assert image is not None
+        color = Quartz.CGImageGetColorSpace(image)
+        assert Quartz.CGColorSpaceUsesITUR_2100TF(color)
+        assert Quartz.CGColorSpaceCopyName(color) == Quartz.kCGColorSpaceITUR_2100_PQ
+
+
+def test_tiff_bundled_profile_preserves_pixels(tmp_path):
+    pixels = np.random.default_rng(41).integers(0, 65536, (8, 16, 3), dtype=np.uint16)
+    path = tmp_path/'portable.tif'
+    with patch.object(io.platform, 'system', return_value='Windows'):
+        assert io.save_image_hdr(str(path), pixels)
+    np.testing.assert_array_equal(cv2.imread(str(path), cv2.IMREAD_UNCHANGED)[..., ::-1], pixels)
+    profile = (Path(io.__file__).parent/'assets'/'bt2100-pq.icc').read_bytes()
+    assert profile in path.read_bytes()
+    assert b'cicp'+bytes(4)+bytes([9,16,0,1]) in profile
+
+
+@pytest.mark.parametrize('nits', [0., 100., 226., 1000., 4000., 10000.])
+def test_jpeg_reconstructs_hdr_with_official_decoder(tmp_path, nits):
+    # Constant patches isolate reconstruction and SDR/HDR endpoints from edge loss.
+    pixels = np.full((64,64,3), np.rint(linear_nits_to_pq(np.array(nits))*65535), dtype=np.uint16)
     path = tmp_path/'hdr.jpeg'
     assert io.save_image_hdr(str(path), pixels)
     raw = tmp_path/'decoded.raw'
@@ -52,17 +98,65 @@ def test_jpeg_reconstructs_hdr_with_official_decoder(tmp_path):
     run('ultrahdr_app', '-m', '1', '-j', str(path), '-o', '0', '-O', '4', '-z', str(raw), '-f', str(metadata))
     decoded = np.fromfile(raw, '<f2').reshape(64,64,4)[...,:3].astype(float)*203
     assert np.isfinite(decoded).all()
-    # HDR must survive (> SDR white); this is not a lossless/visual quality claim.
-    assert decoded.min() > 203 and decoded.max() < 10000
-    assert '--maxContentBoost' in metadata.read_text()
+    if nits > 203:
+        assert decoded.min() > 203 and decoded.max() <= 10000
+    elif nits == 0:
+        assert not decoded.any()
+    capacity = float(next(line.split()[1] for line in metadata.read_text().splitlines()
+                          if line.startswith('--hdrCapacityMax ')))
+    # At >=203 nits, nearest 10-bit PQ packing is within 0.5% of requested nits.
+    assert capacity * 203 == pytest.approx(max(203., nits), rel=.005)
     # Compare against the official encode of independently packed PQ samples.
     code = int(np.rint(float(pixels[0,0,0])*1023/65535))
     reference_raw = tmp_path/'reference.raw'
     np.full((64,64), code+(code<<10)+(code<<20)+(3<<30), dtype='<u4').tofile(reference_raw)
     reference_jpg = tmp_path/'reference.jpg'
     run('ultrahdr_app','-m','0','-p',str(reference_raw),'-w','64','-h','64','-a','5','-C','2','-t','2','-R','1','-q','95','-Q','95','-s','1','-M','1','-z',str(reference_jpg))
-    assert path.read_bytes() == reference_jpg.read_bytes()
+    reference_decoded = tmp_path/'reference-decoded.raw'
+    run('ultrahdr_app','-m','1','-j',str(reference_jpg),'-o','0','-O','4','-z',str(reference_decoded))
+    # New ICC and display capacity must not change official full-HDR reconstruction.
+    assert raw.read_bytes() == reference_decoded.read_bytes()
     assert cv2.imread(str(path)).shape == (64,64,3)  # Ordinary JPEG SDR fallback.
+    np.testing.assert_array_equal(cv2.imread(str(path)), cv2.imread(str(reference_jpg)))
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS ImageIO interoperability')
+@pytest.mark.parametrize('portable_profile', [False, True])
+def test_jpeg_loads_hdr_in_imageio_and_preserves_sdr_scan(tmp_path, portable_profile):
+    import Foundation
+    import Quartz as Q
+
+    pixels = np.full((64,64,3), np.rint(linear_nits_to_pq(np.array(1000.))*65535), dtype=np.uint16)
+    path = tmp_path/'hdr.jpg'
+    with patch.object(io.platform, 'system', return_value='Windows' if portable_profile else 'Darwin'):
+        assert io.save_image_hdr(str(path), pixels)
+    source = Q.CGImageSourceCreateWithURL(Foundation.NSURL.fileURLWithPath_(str(path)), None)
+    image = Q.CGImageSourceCreateImageAtIndex(source, 0, {
+        Q.kCGImageSourceDecodeRequest: Q.kCGImageSourceDecodeToHDR,
+        Q.kCGImageSourceShouldAllowFloat: True,
+    })
+    assert image is not None
+    assert len(Q.CGDataProviderCopyData(Q.CGImageGetDataProvider(image))) > 0
+    assert Q.CGImageGetContentHeadroom(image) > 1
+    assert (Q.CGImageGetWidth(image), Q.CGImageGetHeight(image)) == (64,64)
+    # Replacing only the alternate profile keeps the primary JPEG byte-for-byte,
+    # apart from MPF's secondary length. The decoded SDR fallback also stays exact.
+    before = path.read_bytes()
+    sdr = cv2.imread(str(path))
+    io._tag_jpeg_hdr_gainmap(path)
+    if not portable_profile:
+        assert path.read_bytes() == before
+    np.testing.assert_array_equal(cv2.imread(str(path)), sdr)
+
+
+def test_jpeg_metadata_failure_preserves_existing_file(tmp_path):
+    output = tmp_path/'existing.jpg'
+    output.write_bytes(b'existing')
+    with patch.object(io, '_tag_jpeg_hdr_gainmap', side_effect=RuntimeError('invalid MPF')):
+        with pytest.raises(RuntimeError, match='invalid MPF'):
+            io.save_image_hdr(str(output), np.zeros((32,32,3), dtype=np.uint16))
+    assert output.read_bytes() == b'existing'
+    assert not list(tmp_path.glob('.ultrahdr-*'))
 
 
 @pytest.mark.parametrize('mode', ['ai', 'log'])

@@ -107,6 +107,8 @@ python -m sdr2hdr.cli --help
 
 画像AIと画像Logの出力形式にJPEGとPNGを追加しました。JPEGはlibultrahdrの公式エンコーダーで、変換後のBT.2020/PQ画素を10bit RGB入力へ量子化し、SDR画像とHDR復元用ゲインマップを含むUltra HDR JPEGとして保存します。非可逆圧縮のため画素の完全一致は保証しません。拡張子は `.jpg` または `.jpeg` です。`ultrahdr_app` がPATHに必要です（検証版1.4.0、macOSでは `brew install libultrahdr`）。未導入時は変換開始前にエラーを表示します。
 
+JPEGのHDR復元条件には、10bitに量子化した入力画素の実際の最大輝度を記録します（黒やSDR白以下では、libultrahdrが要求する203ニトより大きい最小の単精度値）。補助画像のBT.2020/PQ ICCはmacOSで読める同じ色空間のプロファイルへ置き換え、主画像と補助画像の圧縮画素、およびHDR復元係数を保持します。macOSはTIFFと共通のシステムICC、それ以外は同梱ICCを使います。macOS側の表示用の明るさ調整まで同一になる保証ではありません。
+
 PNGは16bit RGBをロスレス保存し、PNG第3版のcICPチャンク（9,16,0,1）でBT.2020、PQ、RGB、フルレンジを明示します。JPEGとPNGのHDR表示には対応する閲覧アプリとHDR表示環境が必要です。Ultra HDR非対応のJPEG閲覧アプリではSDR画像を表示します。
 
 ### 入力の複数選択とキュー登録
@@ -119,9 +121,9 @@ PNGは16bit RGBをロスレス保存し、PNG第3版のcICPチャンク（9,16,0
 
 再生にはPythonパッケージとは別にlibmpvが必要です。macOSでは `brew install mpv ffmpeg-full` で導入できます。変換用FFmpegには `zscale` が必要なので、`ffmpeg-full` のbinをPATHに含めてください。macOSのネイティブ表示面はインストール時にビルドするため、Xcode Command Line Toolsも必要です。WindowsではlibmpvのDLLとその依存DLLをPATHに置いてから起動します。
 
-HDRを8bit SDRプレビューに変換せず、macOSでは別々のネイティブレイヤーに出力します。浮動小数の表示面を8bitへ丸めるディザー処理は行いません。HDR入力とEDR出力を確認できない場合は警告を表示します。Windows向けD3D11経路は実装していますが、Windows実機でのHDR表示は未確認です。
+macOSではSDRとHDRを別々のネイティブレイヤーに出力し、浮動小数の表示面を8bitへ丸めるディザー処理は行いません。HDR表示は現在の画面のEDR余裕（SDR白に対する表示可能な明るさの倍率）を取得し、表示用の明るさをBT.2390で収めます。画面移動や明るさの条件変更にも追従します。PQとHLGの入力は表示側で絶対輝度のPQへ変換し、対応するPQ色空間で渡します。比較用静止画は復号した画素から最大輝度を求め、実際には含まれない10,000ニトを想定して圧縮することを避けます。保存ファイルや共通のSDR→HDR変換は変更しません。HDR入力とEDR出力を確認できない場合は警告を表示します。WindowsはD3D11とGPU-nextが取得する画面条件を利用する設定へ変更していますが、Windows実機でのHDR表示は未確認です。閲覧アプリ独自の明るさ調整との見た目の一致を保証する処理ではありません。
 
-本アプリが保存したPNG、TIFF、JPEG XL、AVIF、Ultra HDR JPEGについて、macOSでHDR描画を検証しています。JPEG XLとAVIFはFFmpegで復号して16bit PNGとしてメモリ内でプレイヤーへ渡します。Ultra HDR JPEGは保存にも使うlibultrahdrの公式デコーダーでHDRを復元します。元の保存ファイルは変更しません。TIFFは保存ファイルにPQ色情報がないため、本アプリの既知の出力条件を適用し、色情報に「変換設定」と明記します。入力側のTIFFへこの解釈を適用しません。検証環境はFFmpeg 8.1.2、libmpv 0.41.0、libultrahdr 1.4.0です。
+本アプリが保存したPNG、TIFF、JPEG XL、AVIF、Ultra HDR JPEGについて、macOSでアプリ内のHDR描画を検証しています。JPEG XLとAVIFはFFmpegで復号して16bit PNGとしてメモリ内でプレイヤーへ渡します。Ultra HDR JPEGは保存にも使うlibultrahdrの公式デコーダーでHDRを復元します。元の保存ファイルは変更しません。TIFFの新規保存では、16bit画素を保ったままBT.2100 PQのICCプロファイルを埋め込みます（macOSはシステムのPQプロファイル、それ以外はlibjxl生成のCC0プロファイル）。FFmpegがICCをPQの入力情報として渡さないため、アプリ内では引き続き既知の出力条件を適用し、色情報に「変換設定」と明記します。入力側のTIFFへこの解釈を適用しません。macOSのプレビューでは、同じ画素のPNGとJPEG XLでも表示用の明るさ調整が異なることを確認しています。試したPNGの標準輝度情報（cLLI、mDCV）の追加とApple標準での再保存では、この差を解消できませんでした。JPEGの読み込みは修正していますが、形式間の表示一致やWindows実機のHDR表示は保証していません。検証環境はFFmpeg 8.1.2、libmpv 0.41.0、libultrahdr 1.4.0です。
 
 ### GUIで変換してから書き出す
 
