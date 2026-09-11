@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from sdr2hdr.io import save_image_hdr
+from sdr2hdr.hdr_guidance import linear_nits_to_pq
 from test_compare_images import avif_reference, jpeg_reference
 
 pytestmark = pytest.mark.skipif(
@@ -70,10 +71,7 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
             until(lambda: str(path) in loaded and view.controller is not None and
                   view.controller.ready and view._load_started is None)
             controller=view.controller;surface=controller.hdr.surface
-            # This test isolates decoding/16-bit rendering from display mapping.
-            # A separate test below measures mapping to constrained displays.
-            surface._update_display_peak=lambda: False
-            controller.hdr.mpv['target-peak']=10000
+            # Read the shared linear image before macOS applies display mapping.
             # Lossy AVIF/JPEG patches can vary even near their centres. Inspect
             # at 1:1 pixels so display interpolation is not compared to a single
             # source sample. Both dimensions fit this native framebuffer.
@@ -99,9 +97,10 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
                 until(lambda: bool(actual))
             finally:
                 surface.bridge.comparison_layer_set_callback(surface.layer_pointer,old)
-            actual=np.array(actual)
-            # Two half-float ULPs at PQ values [0.5,1), covering the intermediate
-            # and final RGBA16Float surfaces. No extra allowance for compression:
+            actual=linear_nits_to_pq(np.array(actual)*203.0)
+            # Keep the existing PQ-domain precision requirement (2^-10),
+            # converting the new linear buffer back to PQ for comparison.
+            # No extra allowance for compression:
             # AVIF and JPEG references are the decoded file, not pre-save pixels.
             error=float(np.max(abs(actual-references[suffix])))
             assert error<=2**-10,(suffix,error,actual,references[suffix])
@@ -136,7 +135,7 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
     print('render report:',tmp_path/'render-results.json',flush=True)
 
 
-def test_actual_display_mapping_matches_bt2390_and_hlg_reference(tmp_path):
+def test_actual_linear_output_matches_pq_and_hlg_reference(tmp_path):
     import subprocess
     import tkinter as tk
     from sdr2hdr.compare_images import prepare_image
@@ -145,21 +144,9 @@ def test_actual_display_mapping_matches_bt2390_and_hlg_reference(tmp_path):
     from sdr2hdr.mpv_player import MpvPlayer
     from sdr2hdr.native_surface import create_surface
 
-    # Neutral patches isolate BT.2390 from gamut mapping. Compare the actual
-    # 16-float FBO with a CPU Hermite reference (black level zero, knee .5).
-    # Reference: mpv v0.41.0 video/out/gpu/video_shaders.c, pass_tone_map;
-    # HLG uses BT.2100's inverse OETF and 1000-nit reference OOTF (gamma 1.2).
-    def reference(pq, source_peak, target_peak):
-        if target_peak >= source_peak:
-            return pq
-        source_pq=float(linear_nits_to_pq(np.array(source_peak)))
-        limit=float(linear_nits_to_pq(np.array(target_peak)))/source_pq
-        knee=1.5*limit-.5
-        x=pq/source_pq;t=(x-knee)/(1-knee)
-        curve=((2*t**3-3*t**2+1)*knee+(t**3-2*t**2+t)*(1-knee)
-               +(-2*t**3+3*t**2)*limit)
-        return np.where(x<knee,x,curve)*source_pq
-
+    # The shared buffer must retain source luminance before OS display mapping.
+    # HLG uses BT.2100's inverse OETF and 1000-nit reference OOTF (gamma 1.2),
+    # as used in mpv v0.41.0 video/out/gpu/video_shaders.c.
     codes=np.rint(np.array([.25,.4,.5,.58,.65,.7,.7518271])*65535).astype(np.uint16)
     pixels=np.broadcast_to(np.repeat(codes,64)[None,:,None],(320,448,3)).copy()
     pq_path=tmp_path/'pq.png';assert save_image_hdr(str(pq_path),pixels)
@@ -202,36 +189,31 @@ def test_actual_display_mapping_matches_bt2390_and_hlg_reference(tmp_path):
             assert time.monotonic()<deadline
             time.sleep(.005)
     report={}
-    update_peak=surface._update_display_peak
     try:
         for path,info,pq,peak in [(pq_path,pq_info,codes/65535,pq_info['source_peak_nits']),
                                   (hlg_path,hlg_info,hlg_pq,1000)]:
-            surface._update_display_peak=update_peak
+            actual.clear()
             player.load(str(path),info);player.mpv['video-unscaled']='yes'
-            until(lambda:player.loaded)
-            # Record the real screen-derived target, then control just the
-            # display capacity to reproduce bright/dim-screen conditions.
-            report[path.name]={'screen_target_nits':surface._target_peak,'targets':{}}
+            until(lambda:player.loaded and bool(actual))
             if path==hlg_path:
                 assert not player.mpv['vf']
                 assert player.mpv.video_params['gamma']=='hlg'
             else:
                 assert abs(player.mpv.video_out_params['max-luma']-peak)<.01
-            surface._update_display_peak=lambda:False
-            assert player.mpv['target-trc']=='pq'
-            for target in (203,406,1000):
-                player.mpv['target-peak']=target;actual.clear();surface.pending.set()
-                until(lambda:bool(actual))
-                measured,error=actual[-1];assert error==0
-                expected=reference(pq,peak,target)
-                deviation=float(np.max(abs(measured-expected[:,None])))
-                # Same two RGBA16Float ULP allowance as the precision test.
-                assert deviation<=2**-10,(path.name,target,deviation,measured,expected)
-                assert np.all(np.diff(measured[:,0])>0)
-                assert measured.max()<=float(linear_nits_to_pq(np.array(target)))+2**-10
-                report[path.name]['targets'][target]={'max_pq_error':deviation,'pq':measured[:,0].tolist()}
+            assert player.mpv['target-trc']=='linear'
+            measured,error=actual[-1];assert error==0
+            measured_pq=linear_nits_to_pq(measured*203.0)
+            deviation=float(np.max(abs(measured_pq-pq[:,None])))
+            # Preserve the earlier PQ-domain accuracy requirement.
+            assert deviation<=2**-10,(path.name,deviation,measured,pq)
+            assert np.all(np.diff(measured[:,0])>0)
+            assert measured.max()>1  # HDR values survive until the OS stage.
+            assert surface.layer.EDRMetadata() is not None
+            assert abs(surface._metadata_range[1]-peak)<.15
+            report[path.name]={'max_pq_error':deviation,'linear':measured[:,0].tolist(),
+                               'source_luminance_range':surface._metadata_range}
     finally:
         surface.bridge.comparison_layer_set_callback(surface.layer_pointer,old)
         player.close();root.destroy()
-    (tmp_path/'display-mapping.json').write_text(json.dumps(report,indent=2))
+    (tmp_path/'linear-hdr.json').write_text(json.dumps(report,indent=2))
     print(json.dumps(report,indent=2),flush=True)

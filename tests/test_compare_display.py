@@ -10,22 +10,31 @@ from sdr2hdr.native_surface import MacSurface, WindowsSurface
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='macOS surface')
-def test_display_peak_follows_current_screen_and_sdr_state():
+def test_still_and_hlg_metadata_are_preserved_and_cleared_for_sdr():
+    import Quartz
+
     surface=MacSurface.__new__(MacSurface)
-    surface.player={};surface._target_peak=None;surface._configured_hdr=True
-    screen=Mock();window=Mock();surface.view=Mock()
-    surface.view.window.return_value=window;window.screen.return_value=screen
-    for headroom,expected in [(1,203),(2.5,507),(4.93,1000),(float('nan'),203),(100,10000)]:
-        screen.maximumExtendedDynamicRangeColorComponentValue.return_value=headroom
-        assert surface._update_display_peak()
-        assert surface.player['target-peak']==expected
-        assert isinstance(surface.player['target-peak'],int)
-        assert not surface._update_display_peak()
-    surface._configured_hdr=False
-    assert surface._update_display_peak()
-    assert surface.player['target-peak']==203
-    surface._configured_hdr=True;window.screen.return_value=None
-    assert not surface._update_display_peak()
+    surface.layer=Mock();surface.pending=Mock()
+    player=MagicMock();surface.player=player
+    surface.configure_color(player,{'color_transfer':'arib-std-b67'},True)
+    initial=surface.layer.setEDRMetadata_.call_args.args[0]
+    assert initial is not None
+    player.video_out_params={'min-luma':.005,'max-luma':1000}
+    surface._update_hdr_metadata()
+    first=surface.layer.setEDRMetadata_.call_args.args[0]
+    assert first is not None and first is not initial
+    surface.configure_color(player,{'color_transfer':'smpte2084','source_peak_nits':406},True)
+    player.video_out_params={'min-luma':0,'max-luma':406}
+    surface._update_hdr_metadata()
+    assert surface._metadata_range==(0,406)
+    # A different file starts without the preceding file's brightness metadata.
+    surface.configure_color(player,{'color_transfer':'smpte2084'},True)
+    assert surface._metadata_range is None
+    assert surface.layer.setEDRMetadata_.call_args.args[0] is not first
+    surface.configure_color(player,{},False)
+    surface.layer.setEDRMetadata_.assert_called_with(None)
+    surface.layer.setToneMapMode_.assert_called_with(Quartz.CAToneMapModeNever)
+    player.__setitem__.assert_any_call('target-trc','srgb')
 
 
 def test_windows_delegates_hdr_target_to_display_capabilities():

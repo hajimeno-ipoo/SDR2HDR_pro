@@ -1,21 +1,35 @@
-// A CAOpenGLLayer bridge. Rendering stays in libmpv's public render API.
-// References: mpv/video/out/mac/gl_layer.swift; Apple's CAOpenGLLayer API.
+// libmpv renders into a Core Video texture shared with Metal.
+// Apple: Mixing Metal and OpenGL rendering in a view.
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreVideo/CoreVideo.h>
+#import <Metal/Metal.h>
 #import <OpenGL/gl3.h>
 #import <OpenGL/OpenGL.h>
 
 typedef void (*DrawCallback)(int, int, int);
 
-@interface SDRHDRComparisonLayer : CAOpenGLLayer {
+@interface SDRHDRComparisonLayer : CAMetalLayer {
 @public
     CGLContextObj context;
     CGLPixelFormatObj format;
     DrawCallback callback;
     unsigned long frames;
+    NSString *renderError;
+@private
+    CVPixelBufferRef pixels;
+    CVOpenGLTextureCacheRef glCache;
+    CVOpenGLTextureRef glTexture;
+    CVMetalTextureCacheRef metalCache;
+    CVMetalTextureRef metalTexture;
+    GLuint fbo;
+    id<MTLCommandQueue> commandQueue;
+    int width, height;
 }
+- (void)releaseTextures;
+- (int)renderFrame;
 @end
 
 @implementation SDRHDRComparisonLayer
@@ -24,8 +38,7 @@ typedef void (*DrawCallback)(int, int, int);
     if (!self) return nil;
     CGLPixelFormatAttribute attributes[] = {
         kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_3_2_Core,
-        kCGLPFAAccelerated, kCGLPFADoubleBuffer,
-        kCGLPFAColorSize, (CGLPixelFormatAttribute)64, kCGLPFAColorFloat, 0
+        kCGLPFAAccelerated, 0
     };
     GLint count;
     if (CGLChoosePixelFormat(attributes, &format, &count) != kCGLNoError || !format ||
@@ -33,43 +46,113 @@ typedef void (*DrawCallback)(int, int, int);
         [self release];
         return nil;
     }
-    self.contentsFormat = kCAContentsFormatRGBA16Float;
-    self.asynchronous = NO;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    self.device = device;
+    [device release];
+    self.pixelFormat = MTLPixelFormatRGBA16Float;
+    // Metal's blit encoder copies the shared image into the drawable.
+    self.framebufferOnly = NO;
     self.opaque = YES;
-    return self;
-}
-- (id)initWithLayer:(SDRHDRComparisonLayer *)other {
-    self = [super initWithLayer:other];
-    if (self) {
-        context = CGLRetainContext(other->context);
-        format = CGLRetainPixelFormat(other->format);
-        callback = other->callback;
+    commandQueue = [self.device newCommandQueue];
+    if (!commandQueue ||
+        CVOpenGLTextureCacheCreate(NULL, NULL, context, format, NULL, &glCache) != kCVReturnSuccess ||
+        CVMetalTextureCacheCreate(NULL, NULL, self.device, NULL, &metalCache) != kCVReturnSuccess) {
+        [self release];
+        return nil;
     }
     return self;
 }
-- (CGLPixelFormatObj)copyCGLPixelFormatForDisplayMask:(uint32_t)mask {
-    return CGLRetainPixelFormat(format);
+
+- (void)releaseTextures {
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    fbo = 0;
+    if (glTexture) CFRelease(glTexture);
+    glTexture = NULL;
+    if (metalTexture) CFRelease(metalTexture);
+    metalTexture = NULL;
+    if (pixels) CFRelease(pixels);
+    pixels = NULL;
+    if (glCache) CVOpenGLTextureCacheFlush(glCache, 0);
+    if (metalCache) CVMetalTextureCacheFlush(metalCache, 0);
+    width = height = 0;
 }
-- (CGLContextObj)copyCGLContextForPixelFormat:(CGLPixelFormatObj)pixelFormat {
-    return CGLRetainContext(context);
-}
-- (BOOL)canDrawInCGLContext:(CGLContextObj)ctx pixelFormat:(CGLPixelFormatObj)pf
-             forLayerTime:(CFTimeInterval)t displayTime:(const CVTimeStamp *)ts {
-    return callback != NULL;
-}
-- (void)drawInCGLContext:(CGLContextObj)ctx pixelFormat:(CGLPixelFormatObj)pf
-          forLayerTime:(CFTimeInterval)t displayTime:(const CVTimeStamp *)ts {
-    if (!callback) return;
-    GLint viewport[4], fbo;
-    glGetIntegerv(GL_VIEWPORT, viewport);
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
-    callback(fbo, viewport[2], viewport[3]);
-    glFlush();
+
+- (int)renderFrame {
+    if (!callback || renderError) return renderError ? -1 : 0;
+    int w = (int)(self.bounds.size.width * self.contentsScale);
+    int h = (int)(self.bounds.size.height * self.contentsScale);
+    if (w <= 0 || h <= 0) return 0;
+    CGLSetCurrentContext(context);
+    if (w != width || h != height) {
+        [self releaseTextures];
+        self.drawableSize = CGSizeMake(w, h);
+        NSDictionary *attributes = @{
+            (id)kCVPixelBufferOpenGLCompatibilityKey: @YES,
+            (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        };
+        if (CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_64RGBAHalf,
+                               (CFDictionaryRef)attributes, &pixels) != kCVReturnSuccess ||
+            CVOpenGLTextureCacheCreateTextureFromImage(NULL, glCache, pixels, NULL,
+                                                       &glTexture) != kCVReturnSuccess ||
+            CVMetalTextureCacheCreateTextureFromImage(NULL, metalCache, pixels, NULL,
+                MTLPixelFormatRGBA16Float, w, h, 0, &metalTexture) != kCVReturnSuccess) {
+            renderError = [@"OpenGLとMetalの共有画像を作成できません" retain];
+            return -1;
+        }
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            CVOpenGLTextureGetTarget(glTexture), CVOpenGLTextureGetName(glTexture), 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            renderError = [@"HDR画像の描画先を作成できません" retain];
+            return -1;
+        }
+        width = w;
+        height = h;
+    }
+    id<CAMetalDrawable> drawable = [self nextDrawable];
+    if (!drawable) return 0;
+    callback(fbo, width, height);
+    // Finish OpenGL writes before Metal reads this shared image.
+    glFinish();
+    id<MTLCommandBuffer> command = [commandQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    if (!command || !blit) {
+        renderError = [@"Metalの画像転送を開始できません" retain];
+        return -1;
+    }
+    [blit copyFromTexture:CVMetalTextureGetTexture(metalTexture)
+             sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(width, height, 1)
+               toTexture:drawable.texture destinationSlice:0 destinationLevel:0
+       destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [command presentDrawable:drawable];
+    [command commit];
+    // Do not let the next OpenGL frame overwrite a texture still read by Metal.
+    [command waitUntilCompleted];
+    if (command.status == MTLCommandBufferStatusError) {
+        renderError = [command.error.localizedDescription copy];
+        return -1;
+    }
     frames++;
+    return 1;
 }
+
 - (void)dealloc {
     callback = NULL;
-    if (context) CGLReleaseContext(context);
+    CGLContextObj previous = CGLGetCurrentContext();
+    if (context) CGLSetCurrentContext(context);
+    [self releaseTextures];
+    if (glCache) CFRelease(glCache);
+    if (metalCache) CFRelease(metalCache);
+    [commandQueue release];
+    [renderError release];
+    if (context) {
+        CGLSetCurrentContext(previous == context ? NULL : previous);
+        CGLReleaseContext(context);
+    }
     if (format) CGLReleasePixelFormat(format);
     [super dealloc];
 }
@@ -78,6 +161,8 @@ typedef void (*DrawCallback)(int, int, int);
 void *comparison_layer_create(void) { return [[SDRHDRComparisonLayer alloc] init]; }
 void comparison_layer_set_callback(SDRHDRComparisonLayer *layer, DrawCallback cb) { layer->callback = cb; }
 void comparison_layer_make_current(SDRHDRComparisonLayer *layer) { CGLSetCurrentContext(layer->context); }
+int comparison_layer_draw(SDRHDRComparisonLayer *layer) { return [layer renderFrame]; }
+const char *comparison_layer_error(SDRHDRComparisonLayer *layer) { return layer->renderError.UTF8String; }
 unsigned long comparison_layer_frames(SDRHDRComparisonLayer *layer) { return layer->frames; }
 void comparison_layer_release(SDRHDRComparisonLayer *layer) { [layer release]; }
 

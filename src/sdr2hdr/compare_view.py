@@ -148,7 +148,8 @@ class CompareView(ttk.Frame):
                 for path in (pair.sdr_path, pair.hdr_path):
                     if not Path(path).is_file():
                         raise FileNotFoundError(f"ファイルが見つかりません: {Path(path).name}")
-                sdr_info, hdr_info = ffprobe_comparison(pair.sdr_path), ffprobe_comparison(pair.hdr_path)
+                sdr_info = ffprobe_comparison(pair.sdr_path)
+                hdr_info = ffprobe_comparison(pair.hdr_path, hdr_metadata=not pair.image)
                 if pair.image:
                     from .compare_images import prepare_image
                     sdr_info = prepare_image(pair.sdr_path, sdr_info)

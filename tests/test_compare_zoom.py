@@ -41,7 +41,7 @@ def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_pat
     gl.glReadPixels.argtypes=[ctypes.c_int]*4+[ctypes.c_uint]*2+[ctypes.c_void_p]
     gl.glBindFramebuffer.argtypes=[ctypes.c_uint,ctypes.c_uint]
     gl.glReadBuffer.argtypes=[ctypes.c_uint]
-    captures={};callbacks=[];originals=[]
+    captures={};callbacks=[];originals=[];sizes={}
     centres={};capture_centres=False
     try:
         for index,(sdr,hdr,still) in enumerate([(source,hdr_image,True),(video,hdr_video,False)]):
@@ -59,6 +59,7 @@ def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_pat
                     surface=player.surface;original=surface.draw_callback
                     def capture(fbo,w,h,side=side,original=original):
                         original(fbo,w,h)
+                        sizes[side]=(w,h)
                         gl.glBindFramebuffer(0x8CA8,fbo);gl.glReadBuffer(0x8CE0)
                         data=(ctypes.c_float*(w*4))()
                         gl.glReadPixels(0,h//2,w,1,0x1908,0x1406,data)
@@ -126,7 +127,9 @@ def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_pat
                 assert view.controller.sdr.mpv.video_pan_y==view.controller.hdr.mpv.video_pan_y>0
                 for side in ('sdr','hdr'):
                     assert centres[side][-1][0]>centred[side][0]+10
-                    assert centres[side][-1][1]<centred[side][1]-5
+                    # The shared texture's first row is Metal's top row.
+                    # A downward drag now increases its readback row number.
+                    assert centres[side][-1][1]>centred[side][1]+5
             view.fit_button.invoke()
             assert view.controller.pan==(0,0)
             assert view.controller.sdr.mpv.video_pan_x==view.controller.hdr.mpv.video_pan_x==0
@@ -138,6 +141,11 @@ def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_pat
                 assert view.controller.playing
                 view._toggle()
             print('image' if still else 'video',widths)
+        before_resize=sizes.copy()
+        # Stay above the application's 1680x900 minimum window size.
+        root.geometry('1800x1000')
+        until(lambda:all(sizes[side]!=before_resize[side] for side in ('sdr','hdr')))
+        assert all(w>0 and h>0 for w,h in sizes.values())
     finally:
         for surface,original in originals:
             surface.bridge.comparison_layer_set_callback(surface.layer_pointer,original)

@@ -31,14 +31,19 @@ class VideoInfo:
     field_order: str | None
 
 
-def ffprobe_comparison(path: str) -> dict:
+def ffprobe_comparison(path: str, *, hdr_metadata: bool = False) -> dict:
     """Read source tags, without replacing absent tags with player guesses."""
     import av
 
+    entries = "stream=color_primaries,color_transfer,color_space,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,duration:format=duration"
+    # Our HDR10 encoder repeats static HDR metadata at keyframes. Decode the
+    # first video packet as well: HEVC may expose these tags on the frame only.
+    metadata_args = ["-read_intervals", "%+#1"] if hdr_metadata else []
+    if hdr_metadata:
+        entries += ":stream_side_data:frame_side_data"
     result = subprocess.run([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries",
-        "stream=color_primaries,color_transfer,color_space,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,duration:format=duration",
+        "ffprobe", "-v", "error", "-select_streams", "v:0", *metadata_args,
+        "-show_entries", entries,
         "-of", "json", path,
     ], check=True, capture_output=True, text=True, timeout=20)
     payload = json.loads(result.stdout)
@@ -46,6 +51,27 @@ def ffprobe_comparison(path: str) -> dict:
     if not streams:
         raise ValueError("映像または画像を読み取れません")
     info = streams[0]
+    if hdr_metadata and info.get("color_transfer") == "smpte2084":
+        from fractions import Fraction
+
+        # ISO/IEC 23008-2 MDCV / CLLI payloads, as accepted by CAEDRMetadata.
+        # Encode only the file's tags; never substitute a decoded signal peak.
+        tags = list(info.get("side_data_list", []))
+        for frame in payload.get("frames", []):
+            tags.extend(frame.get("side_data_list", []))
+        for tag in tags:
+            if tag.get("side_data_type") == "Mastering display metadata":
+                coordinates = ("green_x", "green_y", "blue_x", "blue_y",
+                               "red_x", "red_y", "white_point_x", "white_point_y")
+                info["hdr10_display_info"] = struct.pack(
+                    ">8H2I",
+                    *(round(Fraction(tag[key]) * 50000) for key in coordinates),
+                    round(Fraction(tag["max_luminance"]) * 10000),
+                    round(Fraction(tag["min_luminance"]) * 10000),
+                )
+            elif tag.get("side_data_type") == "Content light level metadata":
+                info["hdr10_content_info"] = struct.pack(
+                    ">HH", tag["max_content"], tag["max_average"])
     info["duration"] = info.get("duration") or payload.get("format", {}).get("duration")
     info["bit_depth"] = None
     if info.get("pix_fmt"):

@@ -89,7 +89,8 @@ class MacSurface:
         self._bounds = None
         self._color = None
         self._configured_hdr = False
-        self._target_peak = None
+        self._metadata_range = None
+        self._file_hdr10 = False
         widget.update_idletasks()
         # Tk's Window id is a MacDrawable, not an Objective-C object.
         # Use the exported Tk macOS accessor instead of casting that id.
@@ -112,6 +113,8 @@ class MacSurface:
             ("create", [], ctypes.c_void_p),
             ("set_callback", [ctypes.c_void_p, self.draw_type], None),
             ("make_current", [ctypes.c_void_p], None),
+            ("draw", [ctypes.c_void_p], ctypes.c_int),
+            ("error", [ctypes.c_void_p], ctypes.c_char_p),
             ("frames", [ctypes.c_void_p], ctypes.c_ulong),
             ("release", [ctypes.c_void_p], None),
         ):
@@ -123,7 +126,6 @@ class MacSurface:
         self.layer = objc.objc_object(c_void_p=self.layer_pointer)
         self.draw_error = None
         self.layer.setContentsFormat_(Quartz.kCAContentsFormatRGBA16Float)
-        self.layer.setAsynchronous_(False)
         self.layer.setOpaque_(True)
         self.layer.setBackgroundColor_(AppKit.NSColor.blackColor().CGColor())
         self.view.setLayer_(self.layer)
@@ -159,7 +161,7 @@ class MacSurface:
         def render(fbo, width, height):
             try:
                 self.renderer.render(opengl_fbo=dict(fbo=fbo, w=width, h=height,
-                                                     internal_format=0x881A), flip_y=True)
+                                                     internal_format=0x881A), flip_y=False)
             except Exception as error:
                 self.draw_error = str(error)
         self.draw_callback = self.draw_type(render)
@@ -169,40 +171,59 @@ class MacSurface:
         import Quartz
 
         if hdr:
-            # Always hand Core Animation absolute PQ. HLG's output OOTF depends
-            # on target peak, whereas its named layer color space assumes 1000 nits.
-            trc, primaries, color = "pq", "bt.2020", Quartz.kCGColorSpaceITUR_2100_PQ
+            # mpv linear HDR uses 203 nits per 1.0. CAEDRMetadata declares that
+            # unit; macOS handles the actual display's brightness capacity.
+            trc, primaries, color = "linear", "bt.2020", Quartz.kCGColorSpaceExtendedLinearITUR_2020
         else:
             trc, primaries, color = "srgb", "bt.709", Quartz.kCGColorSpaceSRGB
         player["target-trc"] = trc
         player["target-prim"] = primaries
+        # Preserve the full PQ encoding range before the OS maps it to the
+        # display. This is an intermediate signal limit, not a display peak.
+        player["target-peak"] = 10000 if hdr else 203
         self._color = Quartz.CGColorSpaceCreateWithName(color)
         if self._color is None:
             raise RuntimeError("表示面の色空間を作成できません")
         self.layer.setColorspace_(self._color)
         self.layer.setWantsExtendedDynamicRangeContent_(hdr)
+        self._metadata_range = None
+        self._file_hdr10 = (hdr and info.get("color_transfer") == "smpte2084"
+                            and info.get("source_peak_nits") is None)
+        self.layer.setEDRMetadata_(
+            Quartz.CAEDRMetadata.HDR10MetadataWithDisplayInfo_contentInfo_opticalOutputScale_(
+                info.get("hdr10_display_info") if self._file_hdr10 else None,
+                info.get("hdr10_content_info") if self._file_hdr10 else None,
+                203.0)
+            if hdr else None)
         if self.layer.respondsToSelector_("setToneMapMode:"):
-            # libmpv now maps to the display limit; do not map it a second time.
-            self.layer.setToneMapMode_(Quartz.CAToneMapModeNever)
+            self.layer.setToneMapMode_(Quartz.CAToneMapModeAutomatic if hdr else Quartz.CAToneMapModeNever)
+        if self.layer.respondsToSelector_("setPreferredDynamicRange:"):
+            self.layer.setPreferredDynamicRange_(Quartz.CADynamicRangeHigh if hdr else Quartz.CADynamicRangeStandard)
         self._configured_hdr = hdr
-        self._target_peak = None
-        self._update_display_peak()
         self.pending.set()
 
-    def _update_display_peak(self):
-        # libmpv's OpenGL render API cannot discover this NSView's display.
-        # EDR is relative to SDR white; mpv's PQ output uses 203 nits for 1.0.
-        screen = self.view.window().screen() if self.view and self.view.window() else None
-        headroom = float(screen.maximumExtendedDynamicRangeColorComponentValue()) if screen else 1.0
-        if not math.isfinite(headroom) or headroom < 1:
-            headroom = 1.0
-        # mpv 0.41's target-peak option accepts integer nits, not a float string.
-        peak = min(10000, int(203.0 * headroom)) if self._configured_hdr else 203
-        if peak == self._target_peak:
-            return False
-        self.player["target-peak"] = peak
-        self._target_peak = peak
-        return True
+    def _update_hdr_metadata(self):
+        import Quartz
+
+        # PQ videos use the completed output file's metadata, or Apple's
+        # defaults when absent. mpv fills absent PQ peaks with 10,000 nits;
+        # that inferred value is not mastering-display metadata.
+        if not self._configured_hdr or self._file_hdr10:
+            return
+        # video-out-params describes the decoded/filtered input, including the
+        # still-image peak supplied by the existing format filter. HLG is made
+        # display-linear by mpv's source OOTF before reaching the Metal layer.
+        params = self.player.video_out_params or {}
+        minimum, maximum = params.get("min-luma"), params.get("max-luma")
+        values = (minimum, maximum)
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
+            return
+        if not 0 <= minimum < maximum or values == self._metadata_range:
+            return
+        self.layer.setEDRMetadata_(
+            Quartz.CAEDRMetadata.HDR10MetadataWithMinLuminance_maxLuminance_opticalOutputScale_(
+                minimum, maximum, 203.0))
+        self._metadata_range = values
 
     def _resize(self):
         import AppKit
@@ -242,13 +263,19 @@ class MacSurface:
             self.view.draggable = cursor == "fleur"
             self.view.window().invalidateCursorRectsForView_(self.view)
         changed = self._resize()
-        peak_changed = self._update_display_peak()
-        if changed or peak_changed or self.pending.is_set():
+        if changed or self.pending.is_set():
             self.pending.clear()
             self.bridge.comparison_layer_make_current(self.layer_pointer)
             self.renderer.update()
-            self.layer.display()
-            self.renderer.report_swap()
+            self._update_hdr_metadata()
+            result = self.bridge.comparison_layer_draw(self.layer_pointer)
+            if result < 0:
+                error = self.bridge.comparison_layer_error(self.layer_pointer)
+                raise RuntimeError(error.decode() if error else "Metalの描画に失敗しました")
+            if result:
+                self.renderer.report_swap()
+            else:
+                self.pending.set()
         if self.draw_error:
             raise RuntimeError(self.draw_error)
 
@@ -261,7 +288,7 @@ class MacSurface:
         if (self._configured_hdr and self.bridge.comparison_layer_frames(self.layer_pointer) and screen is not None
                 and self.layer.wantsExtendedDynamicRangeContent()
                 and source.get("gamma") in {"pq", "hlg"}
-                and target_trc in {"pq", "hlg"}
+                and target_trc == "linear" and self.layer.EDRMetadata() is not None
                 and self.player["target-prim"] == "bt.2020"
                 and screen.maximumExtendedDynamicRangeColorComponentValue() > 1):
             return "HDR Output: Active（EDR）"
