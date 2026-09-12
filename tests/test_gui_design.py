@@ -13,6 +13,11 @@ def test_workspace_tabs_and_actions_fit_minimum_window():
         assert left.winfo_rooty() + left.winfo_height() == right.winfo_rooty() + right.winfo_height()
         root.geometry('1680x900')
         root.update()
+        hero = next(w for w in app.compare_view.master.winfo_children() if w.winfo_class() == 'Frame')
+        for label in hero.winfo_children():
+            assert label.winfo_ismapped()
+            assert label.winfo_width() >= label.winfo_reqwidth()
+            assert label.winfo_x() + label.winfo_width() <= hero.winfo_width()
         for tab in (app.ai_tab, app.log_tab, app.img_ai_tab, app.img_log_tab):
             app.notebook.select(tab)
             root.update()

@@ -182,6 +182,8 @@ class SDR2HDRGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("SDR2HDR Pro")
+        self.app_icon = tk.PhotoImage(master=root, file=str(Path(__file__).parent / "assets" / "app-icon.png"))
+        self.root.iconphoto(True, self.app_icon)
         self.root.geometry("1760x1000")
         self.root.minsize(1680, 900)
         self.preview_outputs = PreviewOutputs()
@@ -256,6 +258,16 @@ class SDR2HDRGUI:
         self.root.geometry(f"{width}x{height}+{x}+{y}")
         self._set_state(AppState.IDLE)
         self.root.after(100, self._drain_events)
+        if self.system_name == "Darwin":
+            self.root.after_idle(self._set_macos_menu_name)
+
+    def _set_macos_menu_name(self) -> None:
+        from AppKit import NSApplication
+
+        # Tk installs its initial menu before this idle callback runs.
+        app_menu = NSApplication.sharedApplication().mainMenu().itemAtIndex_(0)
+        app_menu.submenu().setTitle_("SDR2HDR Pro")
+        app_menu.setTitle_("SDR2HDR Pro")
 
     def _close(self):
         if not self._closing:
@@ -285,7 +297,7 @@ class SDR2HDRGUI:
 
         hero = tk.Frame(outer, bg="#efb4eb", highlightbackground="#14200e", highlightthickness=3)
         hero.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 16))
-        tk.Label(hero, text="SDR2HDR", font=("Impact", 46), bg="#efb4eb", fg="#14200e").pack(side="left", padx=22, pady=14)
+        tk.Label(hero, text="SDR2HDR Pro", font=("Impact", 46), bg="#efb4eb", fg="#14200e").pack(side="left", padx=22, pady=14)
         tk.Label(hero, text="いつもの映像を、HDRへ。\n素材と形式を選ぶ → 変換して確認 → 書き出す", justify="left", font=("Helvetica Neue", 12), bg="#efb4eb", fg="#14200e").pack(side="left", padx=20)
         self.hero_art = tk.PhotoImage(file=str(Path(__file__).parent / "assets" / "film-editor.png")).subsample(8)
         tk.Label(hero, image=self.hero_art, bg="#efb4eb", borderwidth=0).pack(side="right", padx=10, pady=8)
