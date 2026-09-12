@@ -44,6 +44,7 @@ class CompareView(ttk.Frame):
         self.rowconfigure(6, weight=1, uniform="video")
         self.pairs = []
         self.controller = None
+        self._loaded_pair = None
         self.closed = False
         self._generation = 0
         self._results = queue.SimpleQueue()
@@ -140,6 +141,45 @@ class CompareView(ttk.Frame):
             self.selection.current(0)
             self._select()
 
+    def remove_pairs(self, hdr_paths):
+        paths = set(hdr_paths)
+        index = self.selection.current()
+        selected = self.pairs[index] if 0 <= index < len(self.pairs) else None
+        remaining = [pair for pair in self.pairs if pair.hdr_path not in paths]
+        if len(remaining) == len(self.pairs):
+            return
+        selected_removed = selected is not None and selected.hdr_path in paths
+        loaded_removed = self._loaded_pair is not None and self._loaded_pair.hdr_path in paths
+        if selected_removed:
+            # A probe already in flight must not reload a deleted preview.
+            self._generation += 1
+        if selected_removed or loaded_removed:
+            if self.controller:
+                self.controller.close()
+                self.controller = None
+            self._loaded_pair = None
+            self._load_started = None
+            self.duration = 0
+            self.position.set(0)
+            self.seekbar.configure(to=1)
+            self.clock.set("00:00 / 00:00")
+            self.zoom.set("100%")
+            self.buttons[2].configure(text="再生")
+            self.sdr_info.set("変換前")
+            self.hdr_info.set("変換後")
+            self.display_state.set("HDR出力未確認")
+            self.message.set("変換が完了すると比較できます。")
+            self.controls.grid()
+            self._enable(False)
+        self.pairs = remaining
+        self.selection.set("")
+        self.selection.configure(values=[f"{i + 1}: {Path(p.hdr_path).name}" for i, p in enumerate(remaining)])
+        if selected in remaining:
+            self.selection.current(remaining.index(selected))
+        elif remaining:
+            self.selection.current(0)
+            self._select()
+
     def _select(self, *_):
         index = self.selection.current()
         if index < 0 or self.closed:
@@ -211,6 +251,7 @@ class CompareView(ttk.Frame):
         self.seekbar.configure(to=max(self.duration, 1))
         self.position.set(0)
         self.controller.load_pair(pair.sdr_path, pair.hdr_path, sdr_info, hdr_info, image=pair.image)
+        self._loaded_pair = pair
         if not pair.image:
             self.controller.set_mute(self.muted.get())
         self.zoom.set("100%")

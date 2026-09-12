@@ -8,7 +8,7 @@ from unittest import mock
 import pytest
 
 from sdr2hdr import app
-from sdr2hdr.io import restamp_hdr_metadata
+from sdr2hdr.io import restamp_hdr_metadata, has_expected_hdr_metadata
 from sdr2hdr.ai import HeuristicEnhancer
 
 
@@ -102,3 +102,57 @@ def test_failed_metadata_update_preserves_original_and_removes_temporary_file(tm
         restamp_hdr_metadata(str(source), 1000, 400)
     assert source.read_bytes() == b'existing file'
     assert list(tmp_path.iterdir()) == [source]
+
+
+@pytest.mark.parametrize('mode', ['ai', 'log'])
+@pytest.mark.parametrize('outcome', ['valid', 'mismatch', 'probe_error', 'disabled'])
+def test_hdr_verification_gates_publication_and_completion(source, tmp_path, mode, outcome):
+    output = tmp_path / 'output.mp4'
+    output.write_bytes(b'previous output')
+    events, completed, statuses = [], [], []
+    callbacks = app.ConversionCallbacks(on_complete=completed.append, on_status=statuses.append)
+
+    def stamp(path, *levels):
+        restamp_hdr_metadata(path, *levels)
+        events.append(('write', path))
+        if outcome == 'mismatch':
+            # Simulate a writer leaving a real video without the required HDR tags.
+            shutil.copy2(source, path)
+
+    def verify(path):
+        assert events == [('write', path)]
+        assert output.read_bytes() == b'previous output'
+        assert not completed
+        events.append(('read', path))
+        if outcome == 'probe_error':
+            raise subprocess.CalledProcessError(1, ['ffprobe', path])
+        return has_expected_hdr_metadata(path)
+
+    request_type, convert = ((app.ConversionRequest, app.run_conversion) if mode == 'ai'
+                             else (app.LogConversionRequest, app.run_log_conversion))
+    request = request_type(str(source), str(output), encoder='libx265',
+                           x265_preset='ultrafast', max_frames=2,
+                           verify_hdr_metadata=outcome != 'disabled',
+                           **({'backend': 'numpy'} if mode == 'ai' else {}))
+    with mock.patch.object(app, 'restamp_hdr_metadata', side_effect=stamp) as writer, \
+         mock.patch.object(app, 'has_expected_hdr_metadata', side_effect=verify) as reader, \
+         mock.patch.object(app, 'build_enhancer', return_value=HeuristicEnhancer()):
+        if outcome in {'mismatch', 'probe_error'}:
+            error = RuntimeError if outcome == 'mismatch' else subprocess.CalledProcessError
+            with pytest.raises(error):
+                convert(request, callbacks)
+            assert not completed and '完了' not in statuses
+            assert output.read_bytes() == b'previous output'
+        else:
+            result = convert(request, callbacks)
+            assert result.processed_frames == 2 and not result.cancelled
+            assert completed == [result] and statuses[-1] == '完了'
+            assert result.output_path == str(output)
+            assert has_expected_hdr_metadata(str(output))
+        if outcome == 'disabled':
+            writer.assert_not_called()
+            reader.assert_not_called()
+        else:
+            assert writer.call_count == reader.call_count == 1
+            assert [event[0] for event in events] == ['write', 'read']
+    assert not list(tmp_path.glob('.sdr2hdr-*'))

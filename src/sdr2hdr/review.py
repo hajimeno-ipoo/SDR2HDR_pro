@@ -159,7 +159,9 @@ def save_hdr_exr(input_path: str, time_sec: float, output_path: str, width: int,
         "half",
         output_path,
     ]
-    process = subprocess.run(cmd, input=frame_2020_linear.astype(np.float32).tobytes(), check=True)
+    # gbrpf32le stores complete G, B, R planes as little-endian float32.
+    frame_gbr_planar = frame_2020_linear[..., [1, 2, 0]].transpose(2, 0, 1).astype("<f4")
+    process = subprocess.run(cmd, input=frame_gbr_planar.tobytes(), check=True)
     if process.returncode != 0:
         raise RuntimeError(f"failed to write HDR EXR: {output_path}")
 

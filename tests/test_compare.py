@@ -145,6 +145,58 @@ def test_four_job_modes_register_only_successful_results():
                 app._start_job.assert_called_once_with(1)
 
 
+def test_removing_pairs_preserves_other_selection_and_discards_late_probe():
+    root = tk.Tk()
+    try:
+        view = CompareView(root)
+        view.pack()
+        with patch.object(view, '_select'):
+            view.add_pair('a.png', 'a_hdr.png', image=True)
+            view.add_pair('b.png', 'b_hdr.png', image=True)
+        view.selection.current(1)
+        controller = Mock(image=True)
+        view.controller = controller
+        view._loaded_pair = view.pairs[1]
+        view.remove_pairs(['a_hdr.png'])
+        controller.close.assert_not_called()
+        assert view.selection.current() == 0 and view.pairs[0].hdr_path == 'b_hdr.png'
+        late_pair = view.pairs[0]
+        generation = view._generation
+        view.remove_pairs(['b_hdr.png'])
+        controller.close.assert_called_once()
+        assert view.controller is None and not view.pairs and not view.selection.get()
+        view._results.put((generation, late_pair, ({}, {})))
+        with patch.object(view, '_load') as load:
+            view._tick()
+            load.assert_not_called()
+        assert view.sdr_info.get() == '変換前' and view.hdr_info.get() == '変換後'
+        with patch.object(view, '_select') as select:
+            view.add_pair('c.png', 'c_hdr.png', image=True)
+            select.assert_called_once()
+    finally:
+        root.destroy()
+
+
+def test_removing_loaded_pair_during_another_selection_releases_old_player():
+    root = tk.Tk()
+    try:
+        view = CompareView(root)
+        with patch.object(view, '_select'):
+            view.add_pair('a.png', 'a_hdr.png', image=True)
+            view.add_pair('b.png', 'b_hdr.png', image=True)
+        controller = Mock(image=True)
+        view.controller = controller
+        view._loaded_pair = view.pairs[0]
+        view.selection.current(1)
+        generation = view._generation
+        view.remove_pairs(['a_hdr.png'])
+        controller.close.assert_called_once()
+        assert view._generation == generation  # The pending probe for B remains valid.
+        assert view.pairs[view.selection.current()].hdr_path == 'b_hdr.png'
+    finally:
+        root.destroy()
+
+
 def test_drag_is_disabled_at_fit_and_clamps_to_image_edges():
     from types import SimpleNamespace
     view = CompareView.__new__(CompareView)

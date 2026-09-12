@@ -1,5 +1,6 @@
 """GUI-owned previews and explicit, byte-preserving delivery."""
 from pathlib import Path
+import shutil
 import tempfile
 
 
@@ -13,6 +14,13 @@ class PreviewOutputs:
 
     def close(self):
         self.directory.cleanup()
+
+    def discard(self, preview_path: str):
+        # Only remove the per-job folder inside this instance's owned cache.
+        folder = Path(preview_path).resolve().parent
+        if folder.parent != Path(self.directory.name).resolve():
+            raise ValueError("このアプリが管理する一時ファイルではありません。")
+        shutil.rmtree(folder)
 
 
 def export_preview(source: str, destination: str, cancel_token, progress=None) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import platform
 import queue
 import re
@@ -225,8 +226,12 @@ class SDR2HDRGUI:
         self.saturation_var = tk.DoubleVar(value=1.05)
         self.saturation_label_var = tk.StringVar(value="1.05x")
         self.hdr_guidance_var = tk.StringVar(value="auto")
+        self.hdr_guidance_label_var = tk.StringVar(value="自動")
+        self.peak_nits_var = tk.StringVar(value=f"{get_presets()['natural'].peak_nits:g}")
         self.luminance_guidance_var = tk.DoubleVar(value=0.70)
         self.reconstruction_strength_var = tk.DoubleVar(value=0.60)
+        self.hdr_detail_controls = []
+        self.hdr_detail_panels = []
         
         self.log_input_var = tk.StringVar()
         self.log_output_var = tk.StringVar()
@@ -305,29 +310,32 @@ class SDR2HDRGUI:
         left = ttk.Frame(outer, padding=(16, 12), style="Card.TFrame")
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(4, weight=1)
+        left.rowconfigure(1, weight=1)
         ttk.Label(left, text="01  /  CONVERT", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         self.notebook = ttk.Notebook(left)
-        self.notebook.grid(row=1, column=0, sticky="ew")
+        self.notebook.grid(row=1, column=0, sticky="nsew")
         self.ai_tab = ttk.Frame(self.notebook, padding=8)
         self.log_tab = ttk.Frame(self.notebook, padding=8)
         self.img_ai_tab = ttk.Frame(self.notebook, padding=8)
         self.img_log_tab = ttk.Frame(self.notebook, padding=8)
         for tab, title in ((self.ai_tab, "動画 AI"), (self.log_tab, "動画 Log"), (self.img_ai_tab, "画像 AI"), (self.img_log_tab, "画像 Log")):
             self.notebook.add(tab, text=title)
-        self._build_ai_tab(self.ai_tab)
+        self.ai_form = self._add_scrollable_ai_form(self.ai_tab)
+        self.img_ai_form = self._add_scrollable_ai_form(self.img_ai_tab)
+        self._build_ai_tab(self.ai_form)
         self._build_log_tab(self.log_tab)
-        self._build_img_ai_tab(self.img_ai_tab)
+        self._build_img_ai_tab(self.img_ai_form)
         self._build_img_log_tab(self.img_log_tab)
         # Group existing controls without changing their variables or processing.
-        for tab, groups in ((self.ai_tab, ((0, "素材と保存先 / プリセット"), (4, "出力形式"), (6, "AI設定"))),
-                            (self.img_ai_tab, ((0, "素材と保存先"), (2, "出力形式"), (3, "AI設定")))):
+        for tab, groups in ((self.ai_form, ((0, "素材と保存先 / プリセット"), (4, "出力形式"), (6, "AI設定"))),
+                            (self.img_ai_form, ((0, "素材と保存先"), (2, "出力形式"), (3, "AI設定")))):
             for row, title in reversed(groups):
                 for widget in tab.grid_slaves():
                     info = widget.grid_info()
                     if int(info["row"]) >= row:
                         widget.grid_configure(row=int(info["row"]) + 1)
                 ttk.Label(tab, text=title, style="Group.TLabel").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(3, 2))
+            self._bind_ai_form_scroll(tab)
         self.feedback_var = tk.StringVar(value="設定した素材を一覧へ追加して、まとめて変換できます。")
         ttk.Label(left, textvariable=self.feedback_var, style="Muted.TLabel", wraplength=540).grid(row=2, column=0, sticky="ew", pady=(6, 0))
         add_queue_slot = ButtonSlot(left, self.reduce_motion_var, text="変換待ちに追加", command=self._enqueue_current, style="Accent.TButton")
@@ -503,7 +511,8 @@ class SDR2HDRGUI:
 
         # AI強度説明用
         ttk.Label(tab, text="AIがどれだけ積極的に輝度を拡張するかを調整します。値を上げるとより眩しいHDRになりますが、上げすぎると不自然な階調になる場合があります。", 
-                  font=("Helvetica", 9), foreground="#555", wraplength=400).grid(row=10, column=1, sticky="w", pady=(0, 4))
+                  font=("Helvetica", 9), foreground="#555", wraplength=400).grid(row=11, column=1, sticky="w", pady=(4, 4))
+        self._add_hdr_details(tab, 10)
 
 
     def _build_log_tab(self, tab: ttk.Frame) -> None:
@@ -555,7 +564,109 @@ class SDR2HDRGUI:
 
         # AI強度説明用
         ttk.Label(tab, text="AIがどれだけ積極的に輝度を拡張するかを調整します。値を上げるとより眩しいHDRになりますが、上げすぎると不自然な階調になる場合があります。", 
-                  font=("Helvetica", 9), foreground="#555", wraplength=400).grid(row=9, column=1, sticky="w", pady=(0, 8))
+                  font=("Helvetica", 9), foreground="#555", wraplength=400).grid(row=10, column=1, sticky="w", pady=(4, 8))
+        self._add_hdr_details(tab, 9)
+
+    def _add_scrollable_ai_form(self, tab):
+        from sdr2hdr.gui_style import PAPER
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(tab, width=1, height=1, background=PAPER, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        form = ttk.Frame(canvas)
+        item = canvas.create_window(0, 0, window=form, anchor="nw")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(item, width=event.width))
+        form.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        return form
+
+    def _bind_ai_form_scroll(self, form):
+        canvas = form.master
+
+        def scroll(event):
+            if canvas.yview() != (0.0, 1.0):
+                delta = event.delta if self.system_name == "Darwin" else event.delta / 120
+                canvas.yview_scroll(-int(delta), "units")
+                return "break"
+
+        def reveal(event):
+            widget = event.widget
+            top = widget.winfo_rooty() - form.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            visible_top = canvas.canvasy(0)
+            if top < visible_top:
+                canvas.yview_moveto(top / form.winfo_height())
+            elif bottom > visible_top + canvas.winfo_height():
+                canvas.yview_moveto((bottom - canvas.winfo_height()) / form.winfo_height())
+
+        def bind_children(widget):
+            widget.bind("<FocusIn>", reveal, add="+")
+            if not isinstance(widget, (ttk.Combobox, ttk.Scale)):
+                widget.bind("<MouseWheel>", scroll, add="+")
+            for child in widget.winfo_children():
+                bind_children(child)
+
+        canvas.bind("<MouseWheel>", scroll)
+        bind_children(form)
+
+    def _add_hdr_details(self, tab, row):
+        section = ttk.Frame(tab)
+        section.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        section.columnconfigure(0, weight=1)
+        body = ttk.Frame(section, padding=(8, 4, 8, 4))
+        body.grid(row=1, column=0, sticky="ew")
+        body.columnconfigure(1, weight=1)
+
+        def toggle():
+            if body.winfo_manager():
+                body.grid_remove()
+                button.configure(text="▶ 詳細HDR設定")
+                tab.master.yview_moveto(0.0)
+            else:
+                body.grid()
+                button.configure(text="▼ 詳細HDR設定")
+                section.update_idletasks()
+                canvas = tab.master
+                canvas.yview_moveto(1.0)
+
+        button = ttk.Button(section, text="▶ 詳細HDR設定", command=toggle,
+                            style="HDRDisclosure.TButton")
+        button.grid(row=0, column=0, sticky="ew")
+        ttk.Label(body, text="目標ピーク輝度").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
+        peak_row = ttk.Frame(body)
+        peak_row.grid(row=0, column=1, sticky="ew", pady=3)
+        peak = ttk.Entry(peak_row, textvariable=self.peak_nits_var, width=10)
+        peak.pack(side="left")
+        ttk.Label(peak_row, text="nit").pack(side="left", padx=(8, 0))
+        guidance = self._add_combo_row(body, 1, "HDR Guidance", self.hdr_guidance_label_var, ["自動", "ON", "OFF"])
+        guidance.bind("<<ComboboxSelected>>", lambda _: self.hdr_guidance_var.set(
+            {"自動": "auto", "ON": "on", "OFF": "off"}[self.hdr_guidance_label_var.get()]))
+        self.hdr_detail_controls.extend((peak, guidance))
+        for index, (label, variable) in enumerate((("輝度ガイダンス", self.luminance_guidance_var),
+                                                    ("復元強度", self.reconstruction_strength_var)), 2):
+            ttk.Label(body, text=label).grid(row=index, column=0, sticky="w", padx=(0, 12), pady=3)
+            slider_row = ttk.Frame(body)
+            slider_row.grid(row=index, column=1, sticky="ew", pady=3)
+            slider_row.columnconfigure(0, weight=1)
+            value = tk.StringVar(value=f"{variable.get():.2f}")
+            variable.trace_add("write", lambda *_, v=variable, text=value: text.set(f"{v.get():.2f}"))
+            scale = ttk.Scale(slider_row, from_=0.0, to=1.0, variable=variable, orient="horizontal")
+            scale.grid(row=0, column=0, sticky="ew")
+            ttk.Label(slider_row, textvariable=value, width=5).grid(row=0, column=1, padx=(8, 0))
+            self.hdr_detail_controls.append(scale)
+        body.grid_remove()
+        self.hdr_detail_panels.append((button, body))
+
+    def _peak_nits(self):
+        try:
+            peak = float(self.peak_nits_var.get())
+        except ValueError:
+            raise ValueError("目標ピーク輝度には、0より大きい数値を入力してください。") from None
+        if not math.isfinite(peak) or peak <= 0:
+            raise ValueError("目標ピーク輝度には、0より大きい数値を入力してください。")
+        return peak
 
     def _build_img_log_tab(self, tab: ttk.Frame) -> None:
         tab.columnconfigure(1, weight=1)
@@ -645,7 +756,12 @@ class SDR2HDRGUI:
             output_var.set(current)
         previous_source, previous_auto = self._output_path_state.get(key, ("", ""))
         automatic = not current or current == previous_auto
-        if automatic and source and (source != previous_source or not current):
+        if source and previous_source and source != previous_source:
+            # A chosen folder persists, but a filename belongs to one input.
+            name = Path(build_output_path(source, extension=extension)).name
+            updated = str(Path(current).with_name(name)) if current else build_output_path(source, extension=extension)
+            automatic = True
+        elif automatic and source and not current:
             updated = build_output_path(source, extension=extension)
         elif current:
             updated = str(Path(current).with_suffix(extension))
@@ -733,6 +849,7 @@ class SDR2HDRGUI:
             config = presets[preset_name]
             self.ai_strength_var.set(config.ai_strength)
             self.saturation_var.set(config.saturation)
+            self.peak_nits_var.set(f"{config.peak_nits:g}")
             self._sync_ai_strength_label()
             self._sync_saturation_label()
         self._sync_mode_hint()
@@ -876,6 +993,7 @@ class SDR2HDRGUI:
                 input_path=self.input_var.get().strip(),
                 output_path=self.output_var.get().strip(),
                 preset=self.preset_var.get(),
+                peak_nits=self._peak_nits(),
                 encoder=self._selected_encoder(),
                 exr_delivery=self._selected_exr_delivery(),
                 x265_mode=self._selected_x265_mode(),
@@ -904,11 +1022,15 @@ class SDR2HDRGUI:
                 input_path=self.img_input_var.get().strip(),
                 output_path=self.img_output_var.get().strip(),
                 preset=self.preset_var.get(),
+                peak_nits=self._peak_nits(),
                 backend=self._selected_backend(),
                 model_path=self.model_path_var.get().strip() or None,
                 ai_strength=self.ai_strength_var.get() if self.model_path_var.get().strip() else None,
                 device="auto",
                 saturation=self.saturation_var.get(),
+                hdr_guidance=self.hdr_guidance_var.get(),
+                luminance_guidance_strength=self.luminance_guidance_var.get(),
+                reconstruction_strength=self.reconstruction_strength_var.get(),
             )
         else:  # Image Log
             return ImageLogConversionRequest(
@@ -970,6 +1092,9 @@ class SDR2HDRGUI:
 
     def _enqueue_request(self, request: ConversionRequest | LogConversionRequest) -> None:
         self._validate_request(request)
+        destination = Path(request.output_path).resolve()
+        if any(Path(job.request.output_path).resolve() == destination for job in self.queue_jobs):
+            raise ValueError("同じ保存先がすでに一覧にあります。出力ファイル名を変更してください。")
         self.queue_jobs.append(QueueJob(request=request))
         self._refresh_job_list()
         if hasattr(self, "feedback_motion"):
@@ -1145,6 +1270,14 @@ class SDR2HDRGUI:
         jobs = [job for job in self.queue_jobs if job.status == "completed" and job.preview_path]
         if not jobs:
             return
+        destinations = [Path(job.request.output_path).resolve() for job in jobs]
+        if len(set(destinations)) != len(destinations):
+            messagebox.showerror(
+                "保存先が重複しています",
+                "同じ保存先の項目があるため、書き出しを停止しました。\n"
+                "一覧から重複する項目を外し、異なる出力ファイル名で追加してください。",
+            )
+            return
         existing = [job.request.output_path for job in jobs if Path(job.request.output_path).exists()]
         if existing and not messagebox.askyesno(
             "既存ファイルを上書き", "次の保存先を上書きしますか？\n" + "\n".join(existing)
@@ -1192,6 +1325,29 @@ class SDR2HDRGUI:
         self.job_detail.delete("1.0", "end")
         self.job_detail.insert("1.0", text)
         self.job_detail.configure(state="disabled")
+
+    def _clear_exported_jobs(self):
+        jobs = [job for job in self.queue_jobs if job.status == "exported" and job.preview_path]
+        if not jobs:
+            return ""
+        try:
+            self.compare_view.remove_pairs(job.preview_path for job in jobs)
+        except Exception as error:
+            self._log(f"書き出し済みですが、比較の解除に失敗しました: {error}")
+            return "比較を解除できなかったため、一時ファイルを残しています。"
+        failed = False
+        for job in jobs:
+            try:
+                self.preview_outputs.discard(job.preview_path)
+            except (OSError, ValueError) as error:
+                failed = True
+                job.error = f"書き出し済みですが、一時ファイルの削除に失敗しました: {error}"
+                self._log(job.error)
+            else:
+                self.queue_jobs.remove(job)
+                job.preview_path = None
+        self._refresh_job_list()
+        return "一部の一時ファイルを削除できませんでした。処理ログを確認してください。" if failed else ""
 
     def _feedback(self, kind, message, row=None):
         if not hasattr(self, "feedback_motion"):
@@ -1251,6 +1407,8 @@ class SDR2HDRGUI:
         self.encoder_combo.configure(state=combo_state)
         self.log_encoder_combo.configure(state=combo_state)
         self.backend_combo.configure(state=combo_state)
+        for control in self.hdr_detail_controls:
+            control.configure(state=combo_state if isinstance(control, ttk.Combobox) else field_state)
         self._sync_encoder_ui()
         self._sync_log_encoder_ui()
         self._sync_model_controls()
@@ -1333,9 +1491,12 @@ class SDR2HDRGUI:
             elif kind == "export_finished":
                 cancelled, error = payload
                 self._finish_current_job()
+                cleanup_warning = self._clear_exported_jobs()
                 self._set_state(AppState.IDLE)
                 self.status_var.set("書き出し失敗" if error else "書き出し停止" if cancelled else "書き出し完了")
                 self.result_var.set(error or ("未書き出しの結果は再度保存できます。" if cancelled else "指定先へ保存しました。「出力を開く」で確認できます。"))
+                if cleanup_warning:
+                    self.result_var.set(f"{self.result_var.get()}\n{cleanup_warning}")
                 self.progress_var.set("" if error or cancelled else "書き出しが完了しました")
                 if error:
                     self._log(error)

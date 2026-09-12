@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import unittest
+import subprocess
+import tempfile
+from pathlib import Path
+
+import cv2
 import numpy as np
 
 from sdr2hdr.review import (
@@ -8,10 +13,35 @@ from sdr2hdr.review import (
     compute_chroma_preservation_error,
     compute_log_luma_mae,
     compute_temporal_luma_delta,
+    save_hdr_exr,
 )
 
 
 class ReviewTests(unittest.TestCase):
+    def test_save_hdr_exr_preserves_rgb_primaries_and_pixel_positions(self) -> None:
+        # Two different rows catch both channel swaps and interleaved/planar errors.
+        primaries = np.array([
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            [[0, 0, 1], [1, 0, 0], [0, 1, 0]],
+        ], dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "primaries.png"
+            output = Path(directory) / "primaries.exr"
+            self.assertTrue(cv2.imwrite(str(source), (primaries * 65535)[..., ::-1]))
+            save_hdr_exr(str(source), 0.0, str(output), width=3, height=2)
+            self.assertGreater(output.stat().st_size, 0)
+            decoded = subprocess.run([
+                "ffmpeg", "-v", "error", "-i", str(output), "-frames:v", "1",
+                # Read the saved half floats without a pixel-format conversion.
+                "-pix_fmt", "gbrpf16le", "-f", "rawvideo", "-",
+            ], check=True, capture_output=True).stdout
+            self.assertEqual(len(decoded), 2 * 3 * 3 * 2)
+            planes = np.frombuffer(decoded, dtype="<f2").reshape(3, 2, 3)
+            # PQ 1 is 10000 nits, so the unchanged 1000-nit reference yields 10.
+            # Both 0 and 10 are exact in EXR half precision: no tolerance is needed.
+            for plane, rgb_channel in zip(planes, (1, 2, 0)):
+                np.testing.assert_array_equal(plane, primaries[..., rgb_channel] * 10)
+
     def test_compute_log_luma_mae_identical(self) -> None:
         frame = np.full((16, 16, 3), 0.5, dtype=np.float32)
         mae = compute_log_luma_mae(frame, frame)

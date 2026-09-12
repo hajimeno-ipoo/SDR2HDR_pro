@@ -25,6 +25,7 @@ from sdr2hdr.io import (
     open_encoder,
     read_frame,
     restamp_hdr_metadata,
+    has_expected_hdr_metadata,
     require_exr_metadata_tool,
     stamp_ap1_exr_sequence,
     exr_sequence_paths,
@@ -920,6 +921,8 @@ def _run_conversion_once(
     if request.encoder in HDR10_ENCODERS and request.verify_hdr_metadata:
         _emit_status(callbacks, "Writing measured HDR metadata without re-encoding")
         restamp_hdr_metadata(request.output_path, int(round(measured_cll)), int(round(measured_fall)))
+        if not has_expected_hdr_metadata(request.output_path):
+            raise RuntimeError("HDRメタデータの検証に失敗しました。BT.2020 / PQ / BT.2020ncを確認できません。")
     result = ConversionResult(output_path=request.output_path, processed_frames=processed, total_frames=total_frames)
     _emit_complete(callbacks, result)
     return result
@@ -945,6 +948,8 @@ def run_log_conversion(request: LogConversionRequest, callbacks=None, cancel_tok
             restamp_prores_metadata(request.output_path)
         elif request.encoder in HDR10_ENCODERS and request.verify_hdr_metadata:
             restamp_hdr_metadata(request.output_path)
+            if not has_expected_hdr_metadata(request.output_path):
+                raise RuntimeError("HDRメタデータの検証に失敗しました。BT.2020 / PQ / BT.2020ncを確認できません。")
     return ConversionResult(request.output_path, processed, total, cancelled)
 
 

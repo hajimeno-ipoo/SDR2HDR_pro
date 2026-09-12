@@ -54,3 +54,49 @@ def test_multiple_inputs_are_separate_jobs_and_single_input_restores_filename(tm
         assert Path(outputs[index].get()).parent == folder
     finally:
         root.destroy()
+
+
+@pytest.mark.parametrize('index', range(4))
+def test_sequential_inputs_replace_filename_keep_folder_and_reject_duplicate(tmp_path, index):
+    root = tk.Tk()
+    gui = SDR2HDRGUI(root)
+    try:
+        gui.notebook.select(index)
+        root.update()
+        inputs = [gui.input_var, gui.log_input_var, gui.img_input_var, gui.img_log_input_var]
+        outputs = [gui.output_var, gui.log_output_var, gui.img_output_var, gui.img_log_output_var]
+        browsers = [gui._browse_input, gui._browse_log_input, gui._browse_img_input, gui._browse_img_log_input]
+        saves = [gui._browse_output, gui._browse_log_output, gui._browse_img_output, gui._browse_img_log_output]
+        if index < 2:
+            (gui.encoder_var if index == 0 else gui.log_encoder_var).set(gui.encoder_options['prores_422hq'])
+        else:
+            (gui.img_format_var if index == 2 else gui.img_log_format_var).set(gui.img_format_options['.png'])
+        extension = '.mov' if index < 2 else '.png'
+        destination = tmp_path / 'chosen.folder' / ('custom.first' + extension)
+        source_a, source_b, source_c = (tmp_path / name for name in ('first.mp4', 'second.mp4', 'third.mp4'))
+        for source in (source_a, source_b, source_c):
+            source.touch()
+        with patch('sdr2hdr.gui.filedialog.askopenfilenames', return_value=(str(source_a),)):
+            browsers[index]()
+        with patch('sdr2hdr.gui.filedialog.asksaveasfilename', return_value=str(destination)):
+            saves[index]()
+        # Selecting the same source must not throw away its custom filename.
+        with patch('sdr2hdr.gui.filedialog.askopenfilenames', return_value=(str(source_a),)):
+            browsers[index]()
+        assert outputs[index].get() == str(destination)
+        gui._enqueue_inputs()
+        for source in (source_b, source_c):
+            with patch('sdr2hdr.gui.filedialog.askopenfilenames', return_value=(str(source),)):
+                browsers[index]()
+            assert outputs[index].get() == str(destination.with_name(source.stem + '_hdr' + extension))
+            gui._enqueue_inputs()
+        assert [job.request.input_path for job in gui.queue_jobs] == [str(p) for p in (source_a, source_b, source_c)]
+        assert [Path(job.request.output_path).name for job in gui.queue_jobs] == [destination.name, 'second_hdr' + extension, 'third_hdr' + extension]
+        assert all(not variable.get() for i, variable in enumerate(inputs) if i != index)
+        # Manually reusing the first destination cannot add an overwriting job.
+        outputs[index].set(str(destination))
+        gui._enqueue_current()
+        assert len(gui.queue_jobs) == 3
+        assert '同じ保存先' in gui.feedback_var.get()
+    finally:
+        gui._close()

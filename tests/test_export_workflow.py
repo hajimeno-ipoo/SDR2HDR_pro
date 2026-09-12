@@ -197,7 +197,7 @@ def test_save_paths_remain_independent_and_keep_manual_location():
         assert output.get() == '/input/second_hdr' + ('.tif' if key.startswith('image') else '.mp4')
     ai_source.set('/input/third.mp4')
     gui._sync_path('video_ai', ai_source, ai_output, '.zip')
-    assert ai_output.get() == '/chosen/custom.name.zip'
+    assert ai_output.get() == '/chosen/third_hdr.zip'
 
 
 @pytest.mark.parametrize('extension', ['.mov','.zip','.mp4','.tif','.jxl','.avif'])
