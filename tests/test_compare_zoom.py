@@ -13,15 +13,13 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform != 'darwin' or os.environ.get('SDR2HDR_TEST_NATIVE_HDR') != '1', reason='Requires native macOS GUI')
 
 
-def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_path):
+def test_video_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_path):
     import tkinter as tk
     from sdr2hdr.gui import SDR2HDRGUI
-    from sdr2hdr.io import save_image_hdr
     from sdr2hdr.app import run_log_conversion, LogConversionRequest
 
     pixels=np.zeros((144,256,3),np.uint8);pixels[60:84,108:116]=180;pixels[60:84,140:148]=180
     source=tmp_path/'source.png';cv2.imwrite(str(source),pixels)
-    hdr_image=tmp_path/'hdr.png';save_image_hdr(str(hdr_image),(pixels.astype(np.uint16)*257))
     video=tmp_path/'source.mp4'
     subprocess.run(['ffmpeg','-v','error','-loop','1','-i',str(source),'-t','1','-r','12',
                     '-c:v','libx264','-pix_fmt','yuv420p','-color_primaries','bt709','-color_trc','bt709',
@@ -44,15 +42,17 @@ def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_pat
     captures={};callbacks=[];originals=[];sizes={}
     centres={};capture_centres=False
     try:
-        for index,(sdr,hdr,still) in enumerate([(source,hdr_image,True),(video,hdr_video,False)]):
+        # Mac still images are covered by test_compare_mac_images using an
+        # existing user image. This FBO test covers the unchanged video path.
+        for index,(sdr,hdr,still) in enumerate([(video,hdr_video,False)]):
             view.add_pair(str(sdr),str(hdr),image=still)
             if index:
                 view.selection.current(index);view._select()
-            until(lambda:view.controller is not None and view.controller.ready and view._load_started is None and not view.zoom_combo.instate(['disabled']))
+            until(lambda:view.controller is not None and view.controller.ready and view._load_started is None and not view.zoom_in.instate(['disabled']))
             assert view.zoom.get()=='100%'
-            assert not view.zoom_combo.instate(['disabled'])
+            assert not view.zoom_in.instate(['disabled'])
             assert bool(view.controls.winfo_ismapped()) is not still
-            for widget in (view.zoom_combo,view.fit_button,view.controls if not still else view.zoom_combo,view.message_label):
+            for widget in (view.zoom_out,view.zoom_in,view.fit_button,view.controls if not still else view.zoom_in,view.message_label):
                 assert widget.winfo_rooty()+widget.winfo_height()<=view.winfo_rooty()+view.winfo_height()
             if not callbacks:
                 for side,player in [('sdr',view.controller.sdr),('hdr',view.controller.hdr)]:
@@ -83,7 +83,7 @@ def test_video_and_image_zoom_changes_both_rendered_sizes_and_fit_resets(tmp_pat
             widths={}
             for percent in (100,50,200,400,25):
                 captures.clear()
-                view.zoom.set(f'{percent}%');view.zoom_combo.event_generate('<<ComboboxSelected>>')
+                view.zoom.set(f'{percent}%');view._zoom_changed()
                 until(lambda: all(len(captures.get(side,[]))>=3 for side in ('sdr','hdr')))
                 widths[percent]={side:captures[side][-1][0] for side in ('sdr','hdr')}
                 assert view.controller.sdr.mpv.pause and view.controller.hdr.mpv.pause

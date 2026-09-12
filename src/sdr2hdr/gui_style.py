@@ -28,6 +28,8 @@ def apply_theme(root: tk.Tk, reduced=None) -> None:
     style.configure("Muted.TLabel", foreground="#505748", font=("Helvetica Neue", 10))
     style.configure("TButton", padding=(10, 8), borderwidth=2, relief="solid", focusthickness=2, focuscolor=INK)
     style.map("TButton", background=[("disabled", "#e7e8df"), ("pressed", GREEN), ("active", "#e8efdf")], foreground=[("disabled", "#74796c")])
+    style.configure("Compare.TButton", padding=(3, 6))
+    style.map("Compare.TButton", background=[("disabled", "#e7e8df"), ("selected", GREEN), ("pressed", GREEN), ("active", "#e8efdf")])
     for name, color, foreground in (("Accent.TButton", PINK, INK), ("Primary.TButton", INK, PAPER)):
         style.configure(name, background=color, foreground=foreground, font=("Helvetica Neue", 12, "bold"), padding=(12, 12))
         style.map(name, background=[("disabled", "#e7e8df"), ("pressed", GREEN), ("active", GREEN)], foreground=[("disabled", "#74796c"), ("pressed", INK), ("active", INK)])

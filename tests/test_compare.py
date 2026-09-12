@@ -33,8 +33,7 @@ def test_render_initialization_failure_releases_player_and_surface():
 def players():
     result = []
     for position in (1.0, 1.0):
-        p = Mock(loaded=True)
-        p.mpv = SimpleNamespace(seeking=False, eof_reached=False)
+        p = Mock(loaded=True, seeking=False, eof_reached=False)
         p.get_position.return_value = position
         result.append(p)
     return result
@@ -77,7 +76,7 @@ def test_eof_pauses_both_players():
     sdr, hdr = players()
     c = CompareController(sdr, hdr)
     c.play()
-    hdr.mpv.eof_reached = True
+    hdr.eof_reached = True
     c.sync_tick()
     assert not c.playing
     sdr.pause.assert_called_once()
@@ -150,13 +149,13 @@ def test_drag_is_disabled_at_fit_and_clamps_to_image_edges():
     from types import SimpleNamespace
     view = CompareView.__new__(CompareView)
     view._pan_drag = None
-    view.zoom_combo = Mock()
-    view.zoom_combo.instate.return_value = False
+    view.fit_button = Mock()
+    view.fit_button.instate.return_value = False
     view.sdr_surface = Mock()
     view.sdr_surface.winfo_width.return_value = 400
     view.sdr_surface.winfo_height.return_value = 200
     view.hdr_surface = Mock()
-    player = SimpleNamespace(mpv=SimpleNamespace(osd_dimensions={'w':800,'h':400,'ml':-400,'mr':-400,'mt':-200,'mb':-200}))
+    player = SimpleNamespace(get_dimensions=lambda: {'w':800,'h':400,'ml':-400,'mr':-400,'mt':-200,'mb':-200})
     view.controller = SimpleNamespace(zoom=1,pan=(0,0),sdr=player,hdr=player)
     view._operate = Mock()
     event = SimpleNamespace(widget=view.sdr_surface,x_root=100,y_root=100)

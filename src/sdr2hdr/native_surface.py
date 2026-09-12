@@ -45,6 +45,26 @@ def create_surface(widget):
     raise RuntimeError("比較プレイヤーはmacOSとWindowsに対応しています")
 
 
+def create_mac_view(widget):
+    """Attach a gesture-forwarding view to Tk's exported native root."""
+    import _tkinter
+    import ctypes
+
+    widget.update_idletasks()
+    tk_library = ctypes.CDLL(_tkinter.__file__)
+    get_root = tk_library.TkMacOSXGetRootControl
+    get_root.argtypes = [ctypes.c_void_p]
+    get_root.restype = ctypes.c_void_p
+    pointer = get_root(widget.winfo_id())
+    if not pointer:
+        raise RuntimeError("Tkinterのネイティブ表示面を取得できません")
+    parent = objc.objc_object(c_void_p=pointer)
+    view = SDRHDRDraggableView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 1, 1))
+    view.pointer_events = queue.SimpleQueue()
+    view.draggable = False
+    return parent, view
+
+
 class WindowsSurface:
     def __init__(self, widget):
         widget.update_idletasks()
@@ -78,7 +98,6 @@ class WindowsSurface:
 
 class MacSurface:
     def __init__(self, widget):
-        import _tkinter
         import ctypes
         import objc
         import AppKit
@@ -91,20 +110,9 @@ class MacSurface:
         self._configured_hdr = False
         self._metadata_range = None
         self._file_hdr10 = False
-        widget.update_idletasks()
         # Tk's Window id is a MacDrawable, not an Objective-C object.
         # Use the exported Tk macOS accessor instead of casting that id.
-        tk_library = ctypes.CDLL(_tkinter.__file__)
-        get_root = tk_library.TkMacOSXGetRootControl
-        get_root.argtypes = [ctypes.c_void_p]
-        get_root.restype = ctypes.c_void_p
-        pointer = get_root(widget.winfo_id())
-        if not pointer:
-            raise RuntimeError("Tkinterのネイティブ表示面を取得できません")
-        self.parent = objc.objc_object(c_void_p=pointer)
-        self.view = SDRHDRDraggableView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 1, 1))
-        self.view.pointer_events = queue.SimpleQueue()
-        self.view.draggable = False
+        self.parent, self.view = create_mac_view(widget)
         self._cursor = None
         from . import _compare_gl
         self.bridge = ctypes.CDLL(_compare_gl.__file__)
@@ -187,8 +195,7 @@ class MacSurface:
         self.layer.setColorspace_(self._color)
         self.layer.setWantsExtendedDynamicRangeContent_(hdr)
         self._metadata_range = None
-        self._file_hdr10 = (hdr and info.get("color_transfer") == "smpte2084"
-                            and info.get("source_peak_nits") is None)
+        self._file_hdr10 = hdr and info.get("color_transfer") == "smpte2084"
         self.layer.setEDRMetadata_(
             Quartz.CAEDRMetadata.HDR10MetadataWithDisplayInfo_contentInfo_opticalOutputScale_(
                 info.get("hdr10_display_info") if self._file_hdr10 else None,
@@ -205,14 +212,13 @@ class MacSurface:
     def _update_hdr_metadata(self):
         import Quartz
 
-        # PQ videos use the completed output file's metadata, or Apple's
+        # PQ images and videos use recorded metadata, or Apple's
         # defaults when absent. mpv fills absent PQ peaks with 10,000 nits;
         # that inferred value is not mastering-display metadata.
         if not self._configured_hdr or self._file_hdr10:
             return
-        # video-out-params describes the decoded/filtered input, including the
-        # still-image peak supplied by the existing format filter. HLG is made
-        # display-linear by mpv's source OOTF before reaching the Metal layer.
+        # HLG is made display-linear by mpv's source OOTF before reaching
+        # the Metal layer. Keep its existing decoded-input metadata handling.
         params = self.player.video_out_params or {}
         minimum, maximum = params.get("min-luma"), params.get("max-luma")
         values = (minimum, maximum)

@@ -62,6 +62,13 @@ class CompareController:
         self._last_correction = time.monotonic()
         self._drift_since = None
 
+    def set_mute(self, muted):
+        if self.image:
+            return
+        self.sdr.set_mute(muted)
+        # Only SDR supplies comparison audio; unmuting must not double it.
+        self.hdr.set_mute(True)
+
     def frame_step(self, direction):
         if not self.ready or self.image:
             return
@@ -76,18 +83,18 @@ class CompareController:
             return None
         now = time.monotonic()
         if self._align_after_step and now - self._last_correction >= 0.15:
-            if not self.sdr.mpv.seeking and not self.hdr.mpv.seeking:
+            if not self.sdr.seeking and not self.hdr.seeking:
                 position = self.sdr.get_position()
                 if position is not None:
                     self.hdr.seek_absolute(position)
                 self._align_after_step = False
         if not self.playing:
             return None
-        if self.sdr.mpv.eof_reached or self.hdr.mpv.eof_reached:
+        if self.sdr.eof_reached or self.hdr.eof_reached:
             self.pause()
             return None
         sdr, hdr = self.sdr.get_position(), self.hdr.get_position()
-        if sdr is None or hdr is None or self.sdr.mpv.seeking or self.hdr.mpv.seeking:
+        if sdr is None or hdr is None or self.sdr.seeking or self.hdr.seeking:
             return None
         if abs(sdr - hdr) <= self.sync_tolerance:
             self._drift_since = None

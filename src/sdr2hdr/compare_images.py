@@ -10,7 +10,6 @@ import subprocess
 import tempfile
 
 import numpy as np
-import cv2
 
 from .io import require_ultrahdr_tool
 
@@ -25,10 +24,17 @@ def _run(command, *, data=None):
     return result.stdout
 
 
-def prepare_image(path: str, info: dict, *, app_hdr_output: bool = False) -> dict:
+def prepare_image(path: str, info: dict, *, app_hdr_output: bool = False, native: bool = False) -> dict:
     """Return original metadata plus a lossless in-memory PNG when necessary."""
     info = dict(info)
     extension = Path(path).suffix.lower()
+    if native:
+        # AppKit reads the original file, including ICC and gain maps. These
+        # labels describe our producer's definition, not a decoded video frame.
+        if app_hdr_output and extension in {".tif", ".tiff", ".jpg", ".jpeg"}:
+            info.update(color_primaries="bt2020", color_transfer="smpte2084",
+                        color_source="変換設定", bit_depth=16 if extension in {".tif", ".tiff"} else 10)
+        return info
     if extension == ".jxl" or (app_hdr_output and extension == ".avif"):
         # Use the same FFmpeg/libjxl already used for export. Homebrew libmpv's
         # separate FFmpeg build has no JPEG XL decoder.
@@ -83,18 +89,4 @@ def prepare_image(path: str, info: dict, *, app_hdr_output: bool = False) -> dic
         ], data=rgb16.tobytes())
         info.update(color_primaries="bt2020", color_transfer="smpte2084",
                     color_source="HDR復元", bit_depth=10)
-    if app_hdr_output and info.get("color_transfer") == "smpte2084":
-        # Provide the actual decoded still's peak to both platform players.
-        # Without light-level metadata mpv otherwise assumes PQ's 10,000 nits.
-        data = info.get("image_bytes")
-        if data is None:
-            data = Path(path).read_bytes()
-        pixels = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
-        if pixels is None or pixels.dtype != np.uint16 or pixels.ndim != 3:
-            raise RuntimeError("HDR比較画像の16bit画素を読み取れません")
-        power = (float(pixels[..., :3].max()) / 65535.0) ** (32.0 / 2523.0)
-        info["source_peak_nits"] = 10000.0 * (
-            max(power - 3424.0 / 4096.0, 0.0)
-            / (2413.0 / 128.0 - 2392.0 / 128.0 * power)
-        ) ** (16384.0 / 2610.0)
     return info

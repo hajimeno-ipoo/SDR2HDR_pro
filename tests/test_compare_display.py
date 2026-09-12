@@ -10,7 +10,7 @@ from sdr2hdr.native_surface import MacSurface, WindowsSurface
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='macOS surface')
-def test_still_and_hlg_metadata_are_preserved_and_cleared_for_sdr():
+def test_pq_stills_use_video_metadata_policy_and_preserve_hlg_and_sdr():
     import Quartz
 
     surface=MacSurface.__new__(MacSurface)
@@ -23,14 +23,18 @@ def test_still_and_hlg_metadata_are_preserved_and_cleared_for_sdr():
     surface._update_hdr_metadata()
     first=surface.layer.setEDRMetadata_.call_args.args[0]
     assert first is not None and first is not initial
-    surface.configure_color(player,{'color_transfer':'smpte2084','source_peak_nits':406},True)
-    player.video_out_params={'min-luma':0,'max-luma':406}
-    surface._update_hdr_metadata()
-    assert surface._metadata_range==(0,406)
-    # A different file starts without the preceding file's brightness metadata.
-    surface.configure_color(player,{'color_transfer':'smpte2084'},True)
-    assert surface._metadata_range is None
-    assert surface.layer.setEDRMetadata_.call_args.args[0] is not first
+    # A PQ image uses the same metadata-free policy as ProRes PQ, even when
+    # mpv reports its inferred 10,000-nit maximum after an HLG input.
+    with patch.object(Quartz, 'CAEDRMetadata') as api:
+        factory=api.HDR10MetadataWithDisplayInfo_contentInfo_opticalOutputScale_
+        surface.configure_color(player,{'color_transfer':'smpte2084'},True)
+        factory.assert_called_once_with(None,None,203.0)
+        assert surface._metadata_range is None
+        surface.layer.setEDRMetadata_.reset_mock()
+        player.video_out_params={'min-luma':0,'max-luma':10000}
+        surface._update_hdr_metadata()
+        surface.layer.setEDRMetadata_.assert_not_called()
+        api.HDR10MetadataWithMinLuminance_maxLuminance_opticalOutputScale_.assert_not_called()
     surface.configure_color(player,{},False)
     surface.layer.setEDRMetadata_.assert_called_with(None)
     surface.layer.setToneMapMode_.assert_called_with(Quartz.CAToneMapModeNever)
@@ -47,16 +51,17 @@ def test_windows_delegates_hdr_target_to_display_capabilities():
     assert player=={'target-prim':'auto','target-trc':'auto','target-peak':'auto'}
 
 
-def test_still_peak_is_cleared_when_loading_video():
+def test_stills_and_videos_load_without_a_peak_override():
     surface=Mock();surface.player_options.return_value={}
     player=MagicMock()
     module=SimpleNamespace(MPV=Mock(return_value=player),strict_decoder=None)
     with patch.dict('sys.modules',mpv=module):
         wrapper=MpvPlayer(surface,hdr=True)
-        wrapper.load('still.png',{'source_peak_nits':406.})
-        player.__setitem__.assert_any_call('vf','format=sig-peak=2')
-        player.__setitem__.reset_mock()
-        wrapper.load('video.mov',{'color_transfer':'smpte2084'})
-        player.__setitem__.assert_called_once_with('vf','')
+        for path in ('日本語/てすと.png','video.mov'):
+            info={'color_transfer':'smpte2084'}
+            wrapper.load(path,info)
+            player.__setitem__.assert_not_called()
+            surface.configure_color.assert_called_with(player,info,True)
+            player.command.assert_called_with('loadfile',path,'replace')
         assert module.MPV.call_args.kwargs['tone_mapping']=='bt.2390'
         assert module.MPV.call_args.kwargs['tone_mapping_param']==.5

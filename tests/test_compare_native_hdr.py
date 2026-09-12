@@ -23,10 +23,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
+def test_mpv_still_decoder_pixels_colour_precision_and_stream_cleanup(tmp_path):
     import cv2
     import tkinter as tk
-    from sdr2hdr.gui import SDR2HDRGUI
+    from sdr2hdr.compare_controller import CompareController
+    from sdr2hdr.compare_images import prepare_image
+    from sdr2hdr.compare_view import color_label
+    from sdr2hdr.io import ffprobe_comparison
+    from sdr2hdr.mpv_player import MpvPlayer
+    from sdr2hdr.native_surface import create_surface
 
     patches=np.array([[.25,.25,.25],[.5,.5,.5],[.58,.58,.58],[.75,.75,.75],
                       [.9,.9,.9],[.7,.5,.4],[.4,.7,.5],[.5,.4,.7]])
@@ -35,7 +40,8 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
     pixels=np.repeat(np.repeat(np.rint(colours*65535).astype(np.uint16)[None],320,0),32,1)
     height,width=pixels.shape[:2];xs=np.arange(len(colours))*32+16
     source=tmp_path/'sdr.png';cv2.imwrite(str(source),np.full((height,width,3),128,np.uint8))
-    paths={suffix:tmp_path/('hdr.'+suffix) for suffix in ['png','jxl','tif','avif','jpg']}
+    folder=tmp_path/'日本語のフォルダ';folder.mkdir()
+    paths={suffix:folder/('てすと.'+suffix) for suffix in ['png','jxl','tif','avif','jpg']}
     references={}
     for suffix,path in paths.items():
         assert save_image_hdr(str(path),pixels)
@@ -46,17 +52,21 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
         else:
             references[suffix]=pixels[height//2,xs]/65535
 
-    root=tk.Tk();app=SDR2HDRGUI(root);root.update();view=app.compare_view
-    loaded=[];original_load=view._load
-    def observe_load(pair,info):
-        original_load(pair,info)
-        loaded.append(pair.hdr_path)
-    view._load=observe_load
+    # libmpv still decoding remains in use on Windows. This opt-in Mac FBO
+    # test checks that decoder path, not Mac's new AppKit image display.
+    root=tk.Tk();root.geometry('800x800')
+    widgets=[tk.Frame(root,width=800,height=400) for _ in range(2)]
+    for widget in widgets: widget.pack()
+    root.update()
+    controller=CompareController(MpvPlayer(create_surface(widgets[0]),hdr=False),
+                                 MpvPlayer(create_surface(widgets[1]),hdr=True))
     def until(condition,seconds=25):
         deadline=time.monotonic()+seconds
         while not condition():
             root.update()
-            assert time.monotonic()<deadline,view.message.get()
+            errors=controller.sdr.poll()+controller.hdr.poll()
+            assert not errors,errors
+            assert time.monotonic()<deadline
             time.sleep(.005)
     gl=ctypes.CDLL('/System/Library/Frameworks/OpenGL.framework/OpenGL')
     gl.glReadPixels.argtypes=[ctypes.c_int]*4+[ctypes.c_uint]*2+[ctypes.c_void_p]
@@ -65,12 +75,11 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
     report={}
     try:
         for index,(suffix,path) in enumerate(paths.items()):
-            view.add_pair(str(source),str(path),image=True)
-            if index:
-                view.selection.current(index);view._select()
-            until(lambda: str(path) in loaded and view.controller is not None and
-                  view.controller.ready and view._load_started is None)
-            controller=view.controller;surface=controller.hdr.surface
+            sdr_info=prepare_image(str(source),ffprobe_comparison(str(source)))
+            hdr_info=prepare_image(str(path),ffprobe_comparison(str(path)),app_hdr_output=True)
+            controller.load_pair(str(source),str(path),sdr_info,hdr_info,image=True)
+            until(lambda: controller.ready)
+            surface=controller.hdr.surface
             # Read the shared linear image before macOS applies display mapping.
             # Lossy AVIF/JPEG patches can vary even near their centres. Inspect
             # at 1:1 pixels so display interpolation is not compared to a single
@@ -109,9 +118,7 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
             assert params['primaries']=='bt.2020' and params['gamma']=='pq'
             # macOS increases available EDR asynchronously after layer activation.
             until(lambda: 'Active' in surface.output_status())
-            until(lambda: not view.message.get())
             assert controller.image and controller.sdr.mpv.pause and controller.hdr.mpv.pause
-            assert not view.controls.winfo_ismapped()
             unique=int(len(np.unique(actual[8:,0])))
             if suffix in {'png','jxl','tif'}:
                 # In the tested interval, an 8-bit grid can contain at most
@@ -124,10 +131,11 @@ def test_actual_still_pixels_colour_precision_and_stream_cleanup(tmp_path):
                 assert unique>max_8bit_levels,(suffix,unique,max_8bit_levels)
             assert len(controller.hdr.mpv._python_streams)==(0 if suffix=='png' else 1)
             report[suffix]={'maximum_pq_error':error,'ramp_levels':unique,
-                            'colour':view.hdr_info.get(),'state':surface.output_status()}
-        sdr,hdr=view.controller.sdr,view.controller.hdr
+                            'colour':color_label(hdr_info),'state':surface.output_status()}
+        sdr,hdr=controller.sdr,controller.hdr
     finally:
-        app._close()
+        controller.close()
+        root.destroy()
     assert sdr.closed and hdr.closed
     assert not sdr.mpv._python_streams and not hdr.mpv._python_streams
     (tmp_path/'render-results.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
@@ -151,7 +159,7 @@ def test_actual_linear_output_matches_pq_and_hlg_reference(tmp_path):
     pixels=np.broadcast_to(np.repeat(codes,64)[None,:,None],(320,448,3)).copy()
     pq_path=tmp_path/'pq.png';assert save_image_hdr(str(pq_path),pixels)
     pq_info=prepare_image(str(pq_path),ffprobe_comparison(str(pq_path)),app_hdr_output=True)
-    assert abs(pq_info['source_peak_nits']-1000)<.15
+    assert 'source_peak_nits' not in pq_info
     hlg_path=tmp_path/'hlg.mkv'
     subprocess.run(['ffmpeg','-v','error','-f','rawvideo','-pixel_format','rgb48le',
                     '-video_size','448x320','-framerate','1','-i','pipe:0','-frames:v','1',
@@ -190,16 +198,16 @@ def test_actual_linear_output_matches_pq_and_hlg_reference(tmp_path):
             time.sleep(.005)
     report={}
     try:
-        for path,info,pq,peak in [(pq_path,pq_info,codes/65535,pq_info['source_peak_nits']),
+        for path,info,pq,peak in [(pq_path,pq_info,codes/65535,None),
                                   (hlg_path,hlg_info,hlg_pq,1000)]:
             actual.clear()
             player.load(str(path),info);player.mpv['video-unscaled']='yes'
             until(lambda:player.loaded and bool(actual))
+            assert not player.mpv['vf']
             if path==hlg_path:
-                assert not player.mpv['vf']
                 assert player.mpv.video_params['gamma']=='hlg'
             else:
-                assert abs(player.mpv.video_out_params['max-luma']-peak)<.01
+                assert surface._metadata_range is None
             assert player.mpv['target-trc']=='linear'
             measured,error=actual[-1];assert error==0
             measured_pq=linear_nits_to_pq(measured*203.0)
@@ -209,7 +217,10 @@ def test_actual_linear_output_matches_pq_and_hlg_reference(tmp_path):
             assert np.all(np.diff(measured[:,0])>0)
             assert measured.max()>1  # HDR values survive until the OS stage.
             assert surface.layer.EDRMetadata() is not None
-            assert abs(surface._metadata_range[1]-peak)<.15
+            if path==hlg_path:
+                assert abs(surface._metadata_range[1]-peak)<.15
+            else:
+                assert surface._metadata_range is None
             report[path.name]={'max_pq_error':deviation,'linear':measured[:,0].tolist(),
                                'source_luminance_range':surface._metadata_range}
     finally:

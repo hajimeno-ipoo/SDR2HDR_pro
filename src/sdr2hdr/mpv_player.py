@@ -18,6 +18,9 @@ class MpvPlayer:
         self.events = queue.SimpleQueue()
         self.closed = False
         self.loaded = False
+        self._position = None
+        self.seeking = False
+        self.eof_reached = False
         self._image_stream = None
         options = dict(
             config=False, load_scripts=False, osc=False, osd_level=0,
@@ -41,6 +44,11 @@ class MpvPlayer:
 
         self._event_callback = on_event
         try:
+            # Receive playback state on mpv's event thread. Synchronous property
+            # reads on Tk's rendering thread can wait for that same renderer.
+            self.mpv.observe_property("time-pos", self._position_changed)
+            self.mpv.observe_property("seeking", self._seeking_changed)
+            self.mpv.observe_property("eof-reached", self._eof_changed)
             surface.attach(self.mpv)
         except Exception:
             try:
@@ -49,18 +57,24 @@ class MpvPlayer:
                 self.mpv.terminate()
             raise
 
+    def _position_changed(self, _, value):
+        self._position = value
+
+    def _seeking_changed(self, _, value):
+        self.seeking = bool(value)
+
+    def _eof_changed(self, _, value):
+        self.eof_reached = bool(value)
+
     def load(self, path: str, info: dict):
         self.mpv.command("stop")
         self._release_image_stream()
         while not self.events.empty():
             self.events.get()
         self.loaded = False
+        self._position = None
+        self.seeking = self.eof_reached = False
         self.mpv.pause = True
-        peak = info.get("source_peak_nits")
-        # format's sig-peak changes only metadata (convert=no is its default).
-        # Clear it on every other load so a still's peak cannot leak into video.
-        self.mpv["vf"] = (f"format=sig-peak={max(1.0, peak / 203.0):.9g}"
-                          if self.hdr and peak is not None else "")
         self.surface.configure_color(self.mpv, info, self.hdr)
         data = info.get("image_bytes")
         if data is not None:
@@ -84,6 +98,8 @@ class MpvPlayer:
                 self.loaded = True
             elif event["event"] == "end-file" and event.get("reason") == "error":
                 errors.append(str(event.get("error", "映像の読み込みに失敗しました")))
+            elif event["event"] == "command-error":
+                errors.append(str(event["error"]))
         self.surface.draw()
         return errors
 
@@ -94,13 +110,17 @@ class MpvPlayer:
         self.mpv.pause = True
 
     def seek_absolute(self, seconds: float):
-        self.mpv.seek(max(0.0, seconds), "absolute", "exact")
+        self.mpv.command_async("seek", max(0.0, seconds), "absolute+exact", callback=self._seek_finished)
+
+    def _seek_finished(self, error, _):
+        if error and not self.closed:
+            self.events.put({"event": "command-error", "error": error})
 
     def step_frame(self, direction: int):
         self.mpv.command("frame-step" if direction > 0 else "frame-back-step")
 
     def get_position(self):
-        return self.mpv.time_pos
+        return self._position
 
     def set_mute(self, muted: bool):
         self.mpv.mute = muted
@@ -111,6 +131,12 @@ class MpvPlayer:
     def set_pan(self, x: float, y: float):
         self.mpv.video_pan_x = x
         self.mpv.video_pan_y = y
+
+    def get_dimensions(self):
+        return self.mpv.osd_dimensions or {}
+
+    def output_status(self):
+        return self.surface.output_status()
 
     def close(self):
         if self.closed:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -73,15 +74,22 @@ class CompareView(ttk.Frame):
         self.hdr_info = tk.StringVar(value="変換後")
         ttk.Label(self, textvariable=self.hdr_info, style="Muted.TLabel").grid(row=7, column=0, sticky="w", pady=(3, 8))
         zoom_controls = ttk.Frame(self)
-        zoom_controls.grid(row=8, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(zoom_controls, text="表示倍率（上下共通）", style="Muted.TLabel").pack(side="left")
+        zoom_controls.grid(row=8, column=0, pady=(0, 8))
+        ttk.Label(zoom_controls, text="共通倍率", style="Muted.TLabel").pack(side="left")
         self.zoom = tk.StringVar(value="100%")
+        self.zoom_out = ttk.Button(zoom_controls, text="−", width=3, style="Compare.TButton",
+                                   command=lambda: self._zoom_step(-1), state="disabled")
+        self.zoom_out.pack(side="left", padx=(8, 0))
         self.zoom_combo = ttk.Combobox(zoom_controls, textvariable=self.zoom, width=6,
                                       values=("25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"), state="disabled")
         self.zoom_combo.pack(side="left", padx=8)
         self.zoom_combo.bind("<<ComboboxSelected>>", self._zoom_changed)
-        self.fit_button = ttk.Button(zoom_controls, text="全体表示", command=self._fit, state="disabled")
-        self.fit_button.pack(side="right")
+        self.zoom_in = ttk.Button(zoom_controls, text="＋", width=3, style="Compare.TButton",
+                                  command=lambda: self._zoom_step(1), state="disabled")
+        self.zoom_in.pack(side="left")
+        self.fit_button = ttk.Button(zoom_controls, text="全体表示", width=7, style="Compare.TButton",
+                                     command=self._fit, state="disabled")
+        self.fit_button.pack(side="left", padx=(12, 0))
         self.controls = ttk.Frame(self)
         self.controls.grid(row=9, column=0, sticky="ew")
         self.controls.columnconfigure(0, weight=1)
@@ -92,18 +100,22 @@ class CompareView(ttk.Frame):
                              ("◀", lambda: self._operate("frame_step", -1)),
                              ("再生", self._toggle),
                              ("▶", lambda: self._operate("frame_step", 1))):
-            button = ttk.Button(buttons, text=text, width=5, command=action, state="disabled")
+            button = ttk.Button(buttons, text=text, width=7, style="Compare.TButton", command=action, state="disabled")
             button.pack(side="left", padx=2)
             self.buttons.append(button)
         self.position = tk.DoubleVar(value=0)
-        self.seekbar = ttk.Scale(self.controls, variable=self.position, from_=0, to=1)
+        self.seekbar = ttk.Scale(self.controls, variable=self.position, from_=0, to=1,
+                                 command=self._seek_changed)
         self.seekbar.grid(row=1, column=0, sticky="ew", pady=6)
         self.seekbar.state(["disabled"])
         self.seekbar.bind("<ButtonPress-1>", self._seek_start)
         self.seekbar.bind("<ButtonRelease-1>", self._seek_end)
-        self.seekbar.bind("<KeyRelease>", self._seek_end)
         self.clock = tk.StringVar(value="00:00 / 00:00")
         ttk.Label(self.controls, textvariable=self.clock, style="Muted.TLabel").grid(row=2, column=0)
+        self.muted = tk.BooleanVar(value=False)
+        self.mute_button = ttk.Checkbutton(buttons, text="ミュート", width=7, style="Compare.TButton", variable=self.muted,
+                                          command=self._mute_changed, state="disabled")
+        self.mute_button.pack(side="left", padx=2)
         self.display_state = tk.StringVar(value="HDR出力未確認")
         ttk.Label(self, textvariable=self.display_state, style="Muted.TLabel").grid(row=10, column=0, sticky="w", pady=(8, 3))
         self.message = tk.StringVar(value="変換が完了すると比較できます。")
@@ -152,8 +164,9 @@ class CompareView(ttk.Frame):
                 hdr_info = ffprobe_comparison(pair.hdr_path, hdr_metadata=not pair.image)
                 if pair.image:
                     from .compare_images import prepare_image
-                    sdr_info = prepare_image(pair.sdr_path, sdr_info)
-                    hdr_info = prepare_image(pair.hdr_path, hdr_info, app_hdr_output=True)
+                    sdr_info = prepare_image(pair.sdr_path, sdr_info, native=sys.platform == "darwin")
+                    hdr_info = prepare_image(pair.hdr_path, hdr_info, app_hdr_output=True,
+                                             native=sys.platform == "darwin")
                 result = (sdr_info, hdr_info)
             except Exception as error:
                 result = error
@@ -162,13 +175,19 @@ class CompareView(ttk.Frame):
         threading.Thread(target=probe, daemon=True).start()
         self._schedule()
 
-    def _create_players(self):
-        from .native_surface import create_surface
-        from .mpv_player import MpvPlayer
+    def _create_players(self, *, image=False):
+        if image and sys.platform == "darwin":
+            from .mac_image_player import MacImagePlayer
+            create = MacImagePlayer
+        else:
+            from .native_surface import create_surface
+            from .mpv_player import MpvPlayer
+            def create(widget, *, hdr):
+                return MpvPlayer(create_surface(widget), hdr=hdr)
         sdr = None
         try:
-            sdr = MpvPlayer(create_surface(self.sdr_surface), hdr=False)
-            hdr = MpvPlayer(create_surface(self.hdr_surface), hdr=True)
+            sdr = create(self.sdr_surface, hdr=False)
+            hdr = create(self.hdr_surface, hdr=True)
         except Exception:
             if sdr:
                 sdr.close()
@@ -176,8 +195,11 @@ class CompareView(ttk.Frame):
         self.controller = CompareController(sdr, hdr)
 
     def _load(self, pair, infos):
+        if self.controller and sys.platform == "darwin" and self.controller.image != pair.image:
+            self.controller.close()
+            self.controller = None
         if not self.controller:
-            self._create_players()
+            self._create_players(image=pair.image)
         sdr_info, hdr_info = infos
         self.sdr_info.set(color_label(sdr_info))
         self.hdr_info.set(color_label(hdr_info))
@@ -189,15 +211,21 @@ class CompareView(ttk.Frame):
         self.seekbar.configure(to=max(self.duration, 1))
         self.position.set(0)
         self.controller.load_pair(pair.sdr_path, pair.hdr_path, sdr_info, hdr_info, image=pair.image)
+        if not pair.image:
+            self.controller.set_mute(self.muted.get())
         self.zoom.set("100%")
         self._load_started = time.monotonic()
 
     def _enable(self, enabled):
         self._pan_drag = None
+        self._dragging = False
         self.zoom_combo.configure(state="readonly" if enabled else "disabled")
+        for button in (self.zoom_out, self.zoom_in):
+            button.state(["!disabled"] if enabled else ["disabled"])
         self.fit_button.state(["!disabled"] if enabled else ["disabled"])
         for button in self.buttons:
             button.state(["!disabled"] if enabled and self.controller and not self.controller.image else ["disabled"])
+        self.mute_button.state(["!disabled"] if enabled and self.controller and not self.controller.image else ["disabled"])
         self.seekbar.state(["!disabled"] if enabled and self.duration > 0 else ["disabled"])
         self._pan_cursor()
 
@@ -206,21 +234,26 @@ class CompareView(ttk.Frame):
         self._operate("set_zoom", float(self.zoom.get().removesuffix("%")) / 100)
         self._pan_cursor()
 
+    def _zoom_step(self, delta):
+        percent = round(float(self.zoom.get().removesuffix("%")))
+        self.zoom.set(f"{max(25, min(400, percent + delta))}%")
+        self._zoom_changed()
+
     def _fit(self):
         self.zoom.set("100%")
         self._zoom_changed()
 
     def _pan_cursor(self):
-        enabled = not self.zoom_combo.instate(["disabled"]) and self.controller and self.controller.zoom > 1
+        enabled = not self.fit_button.instate(["disabled"]) and self.controller and self.controller.zoom > 1
         for surface in (self.sdr_surface, self.hdr_surface):
             surface.configure(cursor="fleur" if enabled else "")
 
     def _pan_start(self, event):
         controller = self.controller
-        if not controller or self.zoom_combo.instate(["disabled"]) or controller.zoom <= 1:
+        if not controller or self.fit_button.instate(["disabled"]) or controller.zoom <= 1:
             return
         player = controller.sdr if event.widget is self.sdr_surface else controller.hdr
-        dimensions = player.mpv.osd_dimensions or {}
+        dimensions = player.get_dimensions()
         if not all(key in dimensions for key in ("w", "h", "ml", "mr", "mt", "mb")):
             return
         width, height = dimensions["w"], dimensions["h"]
@@ -256,12 +289,21 @@ class CompareView(ttk.Frame):
     def _toggle(self):
         self._operate("pause" if self.controller and self.controller.playing else "play")
 
+    def _mute_changed(self):
+        self._operate("set_mute", self.muted.get())
+
     def _seek_start(self, _):
-        self._dragging = True
+        self._dragging = not self.seekbar.instate(["disabled"])
+
+    def _seek_changed(self, value):
+        # ttk.Scale invokes this for pointer/keyboard changes, but not the
+        # position variable updates used to track ordinary playback.
+        if not self.seekbar.instate(["disabled"]):
+            self._operate("seek", float(value))
 
     def _seek_end(self, _):
         self._dragging = False
-        self._operate("seek", self.position.get())
+        self._seek_changed(self.position.get())
 
     def _schedule(self):
         if self._timer is None and not self.closed:
@@ -291,19 +333,25 @@ class CompareView(ttk.Frame):
                     elif time.monotonic() - self._load_started > 20:
                         raise RuntimeError("プレイヤーの読み込みが完了しませんでした")
                 now = time.monotonic()
-                if not controller.image and now >= self._next_sync:
-                    warning = controller.sync_tick()
-                    self._next_sync = now + 0.1
-                    self._sync_warning = warning or ""
+                if not controller.image:
+                    if now >= self._next_sync:
+                        warning = controller.sync_tick()
+                        self._next_sync = now + 0.1
+                        self._sync_warning = warning or ""
                     position = controller.sdr.get_position()
-                    if position is not None and not self._dragging:
+                    if position is not None and not self._dragging and position != self.position.get():
                         self.position.set(position)
-                    self.clock.set(f"{time_label(position)} / {time_label(self.duration)}")
-                    self.buttons[2].configure(text="停止" if controller.playing else "再生")
+                    shown_position = self.position.get() if self._dragging else position
+                    clock = f"{time_label(shown_position)} / {time_label(self.duration)}"
+                    if clock != self.clock.get():
+                        self.clock.set(clock)
+                    play_text = "停止" if controller.playing else "再生"
+                    if self.buttons[2].cget("text") != play_text:
+                        self.buttons[2].configure(text=play_text)
                 if now >= self._next_status:
-                    state = controller.hdr.surface.output_status()
+                    state = controller.hdr.output_status()
                     self.display_state.set(state)
-                    self.message.set(self._sync_warning or self._warning or ("" if "Active" in state else "HDR出力を確認できません。"))
+                    self.message.set(self._sync_warning or self._warning or ("HDR出力を確認できません。" if "未確認" in state else ""))
                     self._next_status = now + 1
         except Exception as error:
             self._fail(error)
