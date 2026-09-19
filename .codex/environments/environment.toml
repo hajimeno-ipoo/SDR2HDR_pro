@@ -8,4 +8,4 @@ script = ""
 [[actions]]
 name = "GUIを起動"
 icon = "run"
-command = "./.venv/bin/python -m sdr2hdr.gui"
+command = "./scripts/launch_macos_app.sh"

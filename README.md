@@ -248,11 +248,19 @@ GUIは作業フォルダーの `models/enhancement_model_20260310.pt` を参照�
 
 ### 起動
 
+macOSでは次のコマンドで起動します。`build/SDR2HDR Pro.app` を作り、専用の名前とアイコンで開きます。このアプリはローカル起動用で、元の作業フォルダーと `.venv` が必要です。
+
+```bash
+./scripts/launch_macos_app.sh
+```
+
+Windowsなど、macOS以外では次のコマンドを使います。
+
 ```bash
 python -m sdr2hdr.gui
 ```
 
-インストール後は `sdr2hdr-gui` でも起動できます。
+macOS以外では、インストール後に `sdr2hdr-gui` でも起動できます。macOSで専用の名前とアイコンを表示する場合は、上記の起動スクリプトを使います。
 
 ## CLI
 

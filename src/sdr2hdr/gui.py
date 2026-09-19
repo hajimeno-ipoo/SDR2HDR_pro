@@ -264,15 +264,72 @@ class SDR2HDRGUI:
         self._set_state(AppState.IDLE)
         self.root.after(100, self._drain_events)
         if self.system_name == "Darwin":
-            self.root.after_idle(self._set_macos_menu_name)
+            self.root.after_idle(self._localize_macos_menu)
+            self.root.bind("<FocusIn>", self._localize_macos_menu_on_focus, add="+")
 
-    def _set_macos_menu_name(self) -> None:
+    def _localize_macos_menu_on_focus(self, event: tk.Event) -> None:
+        if event.widget is self.root:
+            self.root.after_idle(self._localize_macos_menu)
+
+    def _localize_macos_menu(self) -> None:
         from AppKit import NSApplication
 
         # Tk installs its initial menu before this idle callback runs.
-        app_menu = NSApplication.sharedApplication().mainMenu().itemAtIndex_(0)
-        app_menu.submenu().setTitle_("SDR2HDR Pro")
-        app_menu.setTitle_("SDR2HDR Pro")
+        main_menu = NSApplication.sharedApplication().mainMenu()
+        menu_titles = {
+            "File": "ファイル",
+            "Edit": "編集",
+            "Window": "ウインドウ",
+            "Help": "ヘルプ",
+        }
+        item_titles = {
+            "Preferences…": "設定…",
+            "Services": "サービス",
+            "Hide Others": "ほかを隠す",
+            "Show All": "すべてを表示",
+            "Source…": "ソース…",
+            "Run Widget Demo": "ウィジェットのデモを実行",
+            "Close": "閉じる",
+            "Undo": "取り消す",
+            "Redo": "やり直す",
+            "Cut": "切り取り",
+            "Copy": "コピー",
+            "Paste": "貼り付け",
+            "Delete": "削除",
+            "Minimize": "しまう",
+            "Zoom": "拡大／縮小",
+            "Show Previous Tab": "前のタブを表示",
+            "Show Next Tab": "次のタブを表示",
+            "Move Tab To New Window": "タブを新しいウインドウに移動",
+            "Merge All Windows": "すべてのウインドウを結合",
+            "Bring All to Front": "すべてを手前に移動",
+        }
+        for index in range(main_menu.numberOfItems()):
+            menu_item = main_menu.itemAtIndex_(index)
+            submenu = menu_item.submenu()
+            if submenu is None:
+                continue
+            title = "SDR2HDR Pro" if index == 0 else menu_titles.get(menu_item.title())
+            if title:
+                menu_item.setTitle_(title)
+                submenu.setTitle_(title)
+            for item_index in range(submenu.numberOfItems()):
+                item = submenu.itemAtIndex_(item_index)
+                old_title = item.title()
+                if old_title.startswith("About "):
+                    new_title = "SDR2HDR Pro について"
+                elif old_title.startswith("Hide ") and old_title != "Hide Others":
+                    new_title = "SDR2HDR Pro を隠す"
+                elif old_title.startswith("Quit "):
+                    new_title = "SDR2HDR Pro を終了"
+                elif old_title.endswith(" Help"):
+                    new_title = "SDR2HDR Pro ヘルプ"
+                else:
+                    new_title = item_titles.get(old_title)
+                if new_title:
+                    item.setTitle_(new_title)
+                    if item.submenu() is not None:
+                        item.submenu().setTitle_(new_title)
 
     def _close(self):
         if not self._closing:

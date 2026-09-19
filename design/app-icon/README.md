@@ -9,7 +9,8 @@
 - 最終生成画像：`/Users/apple/.codex/generated_images/01a091aa-7fb2-7eb0-ac75-6c84f45608de/exec-123c8f36-d98d-4149-8934-0a3d36c5f20d.png`
 - 編集元：`SDR2HDRPro.icon`。生成画像をsipsで1024×1024へ縮小して格納。
 - アプリが使う出力：`../../src/sdr2hdr/assets/app-icon.png`。Icon Composer 1.6のmacOS Defaultで書き出した1024×1024、透過付きPNG。
-- アイコンの設定：Tk標準の`iconphoto`を起動時に呼ぶ。Python.appの設定ファイルや他のアプリは変更しない。
+- ローカルmacOSアプリ用：`SDR2HDRPro.icns`。上記PNGと同じ画像を含み、`scripts/launch_macos_app.sh`が`build/SDR2HDR Pro.app`へコピーする。
+- アイコンの設定：Tk標準の`iconphoto`と、ローカルmacOSアプリの`Info.plist`を使う。Python.appの設定ファイルや他のアプリは変更しない。
 
 ## 最終生成プロンプト
 
@@ -25,4 +26,4 @@ Icon Composerスキル付属の検証で`SDR2HDRPro.icon`の構造と素材参�
 ictool /absolute/path/SDR2HDRPro.icon --export-image --output-file /absolute/path/app-icon.png --platform macOS --rendition Default --width 1024 --height 1024 --scale 1
 ```
 
-根拠：[Tk 9のiconphoto仕様](https://www.tcl-lang.org/man/tcl9.0/TkCmd/wm.html#M71)。macOSでは最初の画像がDockやダイアログなどのアプリアイコンに使われる。配布用アプリへの梱包やFinder上のPython.appのアイコン変更は今回の対象外。
+根拠：[Tk 9のiconphoto仕様](https://www.tcl-lang.org/man/tcl9.0/TkCmd/wm.html#M71)。macOSでは最初の画像がDockやダイアログなどのアプリアイコンに使われる。Mission Controlなどで使われるmacOSアプリ自体の名前とアイコンは、ローカルアプリの`Info.plist`と`.icns`にも設定する。署名・公証を伴う配布用アプリへの梱包やFinder上のPython.appのアイコン変更は対象外。
