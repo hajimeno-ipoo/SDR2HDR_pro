@@ -39,7 +39,7 @@ def players():
     return result
 
 
-def test_small_difference_is_not_corrected_and_large_difference_is_throttled():
+def test_small_difference_is_not_corrected_and_large_difference_is_silently_throttled():
     sdr, hdr = players()
     c = CompareController(sdr, hdr)
     c.play()
@@ -53,7 +53,8 @@ def test_small_difference_is_not_corrected_and_large_difference_is_throttled():
         c.sync_tick()
         hdr.seek_absolute.assert_called_once()
     with patch('sdr2hdr.compare_controller.time.monotonic', return_value=13.1):
-        assert 'ずれ' in c.sync_tick()
+        assert c.sync_tick() is None
+        assert hdr.seek_absolute.call_count == 2
     hdr.get_position.return_value = 1
     assert c.sync_tick() is None
 

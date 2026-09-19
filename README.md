@@ -319,7 +319,13 @@ python -m pip install -e ".[ai,dev]"
 python -m pytest
 ```
 
-GUIテストは画面を利用できる環境で実行してください。実ファイルを生成するテストにはFFmpegや対応エンコーダーも必要です。テスト成功と、実際のHDR対応画面での見え方の確認は別です。
+GUIテストは画面を利用できる環境で実行してください。Codexなどのバックグラウンド処理からmacOSのGUIテストを実行する場合は、通常のPythonから直接Tkやlibmpvを初期化せず、次の専用ランナーを使います。
+
+```bash
+python scripts/run_macos_gui_tests.py tests/test_macos_gui_smoke.py tests/test_compare.py tests/test_compare_controls.py
+```
+
+このランナーは、選択されたテストを1件ずつ別の`Python.app`で実行します。同じPythonプロセスでTkの画面を繰り返し作成・破棄しないためです。`test_macos_gui_smoke.py`はTkと実際のlibmpvを初期化する検査で、このランナーから実行した場合だけ有効になります。仮想環境の依存関係を使い、各テストの出力と最終的な終了結果を呼び出し元へ戻します。実ファイルを生成するテストにはFFmpegや対応エンコーダーも必要です。テスト成功と、実際のHDR対応画面での見え方の確認は別です。
 
 ## ライセンス
 

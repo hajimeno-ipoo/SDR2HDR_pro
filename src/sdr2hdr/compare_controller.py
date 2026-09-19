@@ -13,13 +13,11 @@ class CompareController:
         self.pan = (0.0, 0.0)
         self.sync_tolerance = 0.050
         self._last_correction = 0.0
-        self._drift_since = None
         self._align_after_step = False
 
     def load_pair(self, sdr_path, hdr_path, sdr_info, hdr_info, *, image=False):
         self.pause()
         self.image = image
-        self._drift_since = None
         self._align_after_step = False
         self.sdr.load(sdr_path, sdr_info)
         self.hdr.load(hdr_path, hdr_info)
@@ -60,7 +58,6 @@ class CompareController:
         self.sdr.seek_absolute(seconds)
         self.hdr.seek_absolute(seconds)
         self._last_correction = time.monotonic()
-        self._drift_since = None
 
     def set_mute(self, muted):
         if self.image:
@@ -97,16 +94,11 @@ class CompareController:
         if sdr is None or hdr is None or self.sdr.seeking or self.hdr.seeking:
             return None
         if abs(sdr - hdr) <= self.sync_tolerance:
-            self._drift_since = None
             return None
-        if self._drift_since is None:
-            self._drift_since = now
         # Allow the preceding asynchronous seek to settle before correcting again.
         if now - self._last_correction >= 0.5:
             self.hdr.seek_absolute(sdr)
             self._last_correction = now
-        if now - self._drift_since >= 3:
-            return "再生位置のずれが続いています。一時停止して位置を確認してください。"
         return None
 
     def close(self):

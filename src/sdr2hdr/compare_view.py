@@ -51,7 +51,6 @@ class CompareView(ttk.Frame):
         self._timer = None
         self._load_started = None
         self._warning = ""
-        self._sync_warning = ""
         self._dragging = False
         self._pan_drag = None
         self._next_sync = self._next_status = 0
@@ -190,7 +189,6 @@ class CompareView(ttk.Frame):
             self.controller.pause()
         self._enable(False)
         self._warning = ""
-        self._sync_warning = ""
         self.message.set("比較素材を読み込んでいます…")
         pair = self.pairs[index]
         self.controls.grid_remove() if pair.image else self.controls.grid()
@@ -376,9 +374,8 @@ class CompareView(ttk.Frame):
                 now = time.monotonic()
                 if not controller.image:
                     if now >= self._next_sync:
-                        warning = controller.sync_tick()
+                        controller.sync_tick()
                         self._next_sync = now + 0.1
-                        self._sync_warning = warning or ""
                     position = controller.sdr.get_position()
                     if position is not None and not self._dragging and position != self.position.get():
                         self.position.set(position)
@@ -392,7 +389,7 @@ class CompareView(ttk.Frame):
                 if now >= self._next_status:
                     state = controller.hdr.output_status()
                     self.display_state.set(state)
-                    self.message.set(self._sync_warning or self._warning or ("HDR出力を確認できません。" if "未確認" in state else ""))
+                    self.message.set(self._warning or ("HDR出力を確認できません。" if "未確認" in state else ""))
                     self._next_status = now + 1
         except Exception as error:
             self._fail(error)
